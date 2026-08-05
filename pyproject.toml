@@ -15,28 +15,31 @@ dependencies = [
     "fsspec[gcs]>=2024.6.0",
     "gym-aloha>=0.1.1",
     "imageio>=2.36.1",
-    "jax[cuda12]==0.5.0",
+    "jax[cuda12]==0.5.3",
     "jaxtyping==0.2.36",
     "ml_collections==1.0.0",
-    "numpy>=1.26.4",
+    "numpy>=1.22.4,<2.0.0",
     "numpydantic>=1.6.6",
     "opencv-python>=4.10.0.84",
     "openpi-client",
-    "orbax-checkpoint==0.11.1",
+    "orbax-checkpoint==0.11.13",
     "pillow>=11.0.0",
-    "s3fs>=2024.9.0",
     "sentencepiece>=0.2.0",
-    "torch>=2.5.1",
+    "torch==2.7.1",
     "tqdm-loggable>=0.2",
     "typing-extensions>=4.12.2",
     "tyro>=0.9.5",
     "wandb>=0.19.1",
-    "boto3>=1.35.7",
-    "types-boto3[boto3,s3]>=1.35.7",
     "filelock>=3.16.1",
-    "beartype>=0.19.0",
+    "beartype==0.19.0",
+    "chex==0.1.90",
     "treescope>=0.1.7",
-    "transformers==4.48.1",
+    "transformers==4.53.2",
+    "rich>=14.0.0",
+    "polars>=1.30.0",
+    "lerobot",
+    "datasets<4",
+    "nvidia-cuda-nvrtc-cu12>=12.6.77",
 ]
 
 
@@ -53,25 +56,21 @@ dev = [
     "matplotlib>=3.10.0",
     "pynvml>=12.0.0",
 ]
-# LeRobot dataset/training path. Kept as a dependency-GROUP (not a [project] dependency) on purpose:
-# groups are NOT propagated to projects that depend on openpi, so the root robometer-policy-learning
-# project does not have to resolve lerobot (which pulls pyav and breaks resolution there). Installed
-# by default in THIS (openpi) env via [tool.uv] default-groups below. Pinned to the pre-v2-API rev
-# (LEROBOT_HOME / LeRobotDataset.create / consolidate) in [tool.uv.sources].
-lerobot = ["lerobot"]
+rlds = [
+    # NOTE: tensorflow-cpu 2.15.0 only ships cp311 wheels on PyPI.
+    # Use `uv venv --python 3.11` before `uv sync --group rlds`.
+    "dlimp",
+    "tensorflow-cpu==2.15.0",
+    "tensorflow-datasets==4.9.9",
+]
 
 [tool.uv]
-default-groups = ["dev", "lerobot"]
-# NOTE: the committed uv.lock is the ONLY viable lock for the lerobot group — `pyav` (a lerobot dep)
-# is no longer resolvable from the package index, so `uv lock` cannot regenerate it. Always use the
-# openpi env with `--frozen` (uv run --frozen / uv sync --frozen). Plain `uv run` here would try to
-# re-resolve and fail on pyav. The lerobot group is kept OUT of [project.dependencies] so the parent
-# robometer-policy-learning project (which depends on openpi) does not have to resolve lerobot/pyav.
-
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }
-lerobot = { git = "https://github.com/huggingface/lerobot", rev = "6674e368249472c91382eb54bb8501c94c7f0c56" }
+dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
+lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
 
 [tool.uv.workspace]
 members = ["packages/*"]
@@ -79,7 +78,7 @@ members = ["packages/*"]
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-extend-exclude = ["docker", "third_party"]
+extend-exclude = ["docker", "third_party", "src/openpi/models_pytorch/transformers_replace/*"]
 
 [tool.ruff.lint]
 # https://docs.astral.sh/ruff/rules/
@@ -107,7 +106,6 @@ select = [
     "PLR5",
     "PLW",
     "PT",
-    "PTH",
     "Q",
     "RET",
     "RUF",
@@ -123,6 +121,7 @@ ignore = [
     "T201",   # We use print statements.
     "PD008",  # Lots of false positives.
     "ISC001", # Disabling to support ruff format.
+    "LOG015", # Use logger.info.
 ]
 unfixable = [
     "B905", # Fix defaults to strict=False, which is not what we want.

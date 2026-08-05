@@ -37,7 +37,7 @@ class DroidInputs(transforms.DataTransformFn):
         if gripper_pos.ndim == 0:
             # Ensure gripper position is a 1D array, not a scalar, so we can concatenate with joint positions
             gripper_pos = gripper_pos[np.newaxis]
-        state = np.concatenate([data["observation/joint_position"], gripper_pos], axis=-1)
+        state = np.concatenate([data["observation/joint_position"], gripper_pos])
 
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
         # stores as float32 (C,H,W), gets skipped for policy inference
@@ -78,4 +78,4 @@ class DroidInputs(transforms.DataTransformFn):
 class DroidOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         # Only return the first 8 dims.
-        return {"actions": np.asarray(data["actions"][:, :8])}
+        return {"actions": np.asarray(data["actions"][..., :8])}

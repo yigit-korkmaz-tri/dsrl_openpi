@@ -181,6 +181,7 @@ class Unnormalize(DataTransformFn):
             return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1)
         return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
 
+
 @dataclasses.dataclass(frozen=True)
 class ResizeImages(DataTransformFn):
     height: int
@@ -263,6 +264,12 @@ class TokenizePrompt(DataTransformFn):
         else:
             state = None
 
+        if self.discrete_state_input:
+            if (state := data.get("state", None)) is None:
+                raise ValueError("State is required.")
+        else:
+            state = None
+
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
@@ -338,6 +345,19 @@ class PadStatesAndActions(DataTransformFn):
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
         return data
+
+@dataclasses.dataclass(frozen=True)
+class PadStatesAndActions(DataTransformFn):
+    """Zero-pads states and actions to the model action dimension."""
+
+    model_action_dim: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
+        if "actions" in data:
+            data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+        return data
+
 
 def flatten_dict(tree: at.PyTree) -> dict:
     """Flatten a nested dictionary. Uses '/' as the separator."""
