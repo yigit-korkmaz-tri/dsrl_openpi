@@ -53,10 +53,25 @@ dev = [
     "matplotlib>=3.10.0",
     "pynvml>=12.0.0",
 ]
+# LeRobot dataset/training path. Kept as a dependency-GROUP (not a [project] dependency) on purpose:
+# groups are NOT propagated to projects that depend on openpi, so the root robometer-policy-learning
+# project does not have to resolve lerobot (which pulls pyav and breaks resolution there). Installed
+# by default in THIS (openpi) env via [tool.uv] default-groups below. Pinned to the pre-v2-API rev
+# (LEROBOT_HOME / LeRobotDataset.create / consolidate) in [tool.uv.sources].
+lerobot = ["lerobot"]
+
+[tool.uv]
+default-groups = ["dev", "lerobot"]
+# NOTE: the committed uv.lock is the ONLY viable lock for the lerobot group — `pyav` (a lerobot dep)
+# is no longer resolvable from the package index, so `uv lock` cannot regenerate it. Always use the
+# openpi env with `--frozen` (uv run --frozen / uv sync --frozen). Plain `uv run` here would try to
+# re-resolve and fail on pyav. The lerobot group is kept OUT of [project.dependencies] so the parent
+# robometer-policy-learning project (which depends on openpi) does not have to resolve lerobot/pyav.
 
 
 [tool.uv.sources]
 openpi-client = { workspace = true }
+lerobot = { git = "https://github.com/huggingface/lerobot", rev = "6674e368249472c91382eb54bb8501c94c7f0c56" }
 
 [tool.uv.workspace]
 members = ["packages/*"]

@@ -6,7 +6,10 @@ from typing import Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-# import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+# NOTE: lerobot is an optional dependency in this repo (not pinned in pyproject; the DSRL/online path
+# never needs it). It is imported lazily inside create_dataset() so importing this module does not
+# require lerobot. The LeRobot training path (e.g. pi05_libero_hitl_lora) DOES require it installed --
+# add lerobot (huggingface git rev) to the openpi env before running that path.
 import numpy as np
 import torch
 
@@ -88,6 +91,15 @@ def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseMod
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+
+    try:
+        import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+    except ImportError as e:  # noqa: BLE001
+        raise ImportError(
+            "Training on a LeRobot dataset requires the `lerobot` package, which is not installed in "
+            "this openpi environment. Install it (huggingface/lerobot git rev) before running the "
+            "LeRobot training path, e.g. the pi05_libero_hitl_lora config."
+        ) from e
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, local_files_only=data_config.local_files_only)
     dataset = lerobot_dataset.LeRobotDataset(

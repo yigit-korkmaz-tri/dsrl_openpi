@@ -5,6 +5,8 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import dataclasses
+
 import numpy as np
 import tqdm
 import tyro
@@ -37,8 +39,12 @@ def create_dataset(config: _config.TrainConfig) -> tuple[_config.DataConfig, _da
     return data_config, dataset
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(config_name: str, repo_id: str | None = None, max_frames: int | None = None):
     config = _config.get_config(config_name)
+    # Optional per-run repo override (e.g. an iterative-HITL round's exported LeRobot repo), so norm
+    # stats can target a dataset other than the config's default without editing the config.
+    if repo_id is not None:
+        config = dataclasses.replace(config, data=dataclasses.replace(config.data, repo_id=repo_id))
     data_config, dataset = create_dataset(config)
 
     num_frames = len(dataset)

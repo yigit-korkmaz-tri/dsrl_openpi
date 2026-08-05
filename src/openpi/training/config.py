@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.libero_hitl_policy as libero_hitl_policy
 import openpi.policies.bridge_policy as bridge_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -394,6 +395,57 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotLiberoHitlDataConfig(DataConfigFactory):
+    """LIBERO data config that additionally carries a per-frame ``intervention`` label (HITL).
+
+    Same as :class:`LeRobotLiberoDataConfig` except the repack mapping keeps an ``intervention`` key
+    and the input transform is :class:`libero_hitl_policy.LiberoHitlInputs` (which forwards it). Used
+    by the Flow-MILE scaffold config so the label reaches the (future) HITL loss. ``intervention``
+    stays a per-frame scalar — intentionally NOT in ``action_sequence_keys`` (not chunked).
+
+    Scaffold status: this makes the label survive up to the model-input transforms; the final
+    data-loader hand-off (``create_data_loader``) still yields only ``(Observation, Actions)``, so
+    finishing the Flow-MILE path requires the train.py / model.py wiring documented there.
+    """
+
+    extra_delta_transform: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                        "intervention": "intervention",  # HITL: keep the per-frame label
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[libero_hitl_policy.LiberoHitlInputs(model_type=model_config.model_type)],
+            outputs=[libero_hitl_policy.LiberoOutputs()],
+        )
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -700,6 +752,86 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
+    ),
+    #
+    # HITL fine-tuning of pi0.5 on LIBERO (see scripts/collect_hitl_libero_pi0.py +
+    # scripts/export_hitl_to_lerobot.py + scripts/hitl_pi0_loop.py).
+    #
+    # HG-DAgger (aggregation BC), LoRA. Fine-tunes on an EXPORTED HITL LeRobot dataset (corrections +
+    # aggregated demos); no loss changes — plain flow-matching BC, aggregation is the anti-forgetting
+    # mechanism. Override the dataset and init checkpoint per round, e.g.:
+    #   uv run scripts/train.py pi05_libero_hitl_lora \
+    #       --data.repo_id=<exported-repo> \
+    #       --weight-loader.params-path=<round R-1 params dir> --exp-name=...-rR
+    # First round inits from the LIBERO-tuned pi0.5 checkpoint below.
+    TrainConfig(
+        name="pi05_libero_hitl_lora",
+        model=pi0.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",  # override with the exported HITL repo per round
+            base_config=DataConfig(local_files_only=True, prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        # LoRA freeze filter must match the model variants above.
+        freeze_filter=pi0.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,  # EMA off for LoRA finetuning
+        batch_size=16,
+        num_train_steps=5_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200, peak_lr=5e-5, decay_steps=5_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+    ),
+    # Flow-MILE, LoRA — SCAFFOLD ONLY. Uses the intervention-preserving data config so the per-frame
+    # label reaches the model-input transforms. The Flow-MILE probit/BCE loss itself is NOT wired yet:
+    # finishing it requires (a) carrying `intervention` past create_data_loader's (Observation, Actions)
+    # hand-off, (b) a frozen rollout-policy snapshot + K sampled/scored action chunks and the probit in
+    # train_step/pi0.py, and (c) MILE hyperparameters on a TrainConfig subclass. See the plan and the
+    # in-house robometer_policy_learning/algorithms/flow_mile spec. Running this today trains like
+    # HG-DAgger (the extra label is currently ignored downstream) — it exists to pin the config name +
+    # data path so the loss can be dropped in without a config churn.
+    TrainConfig(
+        name="pi05_libero_flow_mile_lora",
+        model=pi0.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoHitlDataConfig(
+            repo_id="physical-intelligence/libero",  # override with the exported HITL repo per round
+            base_config=DataConfig(local_files_only=True, prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_libero/params"),
+        freeze_filter=pi0.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=16,
+        num_train_steps=5_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200, peak_lr=5e-5, decay_steps=5_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
     ),
     #
     # Fine-tuning Aloha configs.
