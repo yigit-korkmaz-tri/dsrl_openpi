@@ -13,10 +13,25 @@ Output LeRobot format:
   - action: 14D joint positions (absolute target = joints[t+1])
   - observation.images.{head, left_wrist, right_wrist}: RGB video
 
-Usage:
+Usage (single raw dataset):
   uv run examples/yam/convert_yam_data_to_lerobot.py \
       --args.raw-dir /home/yuzhi/dataset/place_lock_simple_raw \
       --args.repo-id yuzhi/yam_place_lock_simple
+
+Usage (MERGE several raw datasets into ONE LeRobot dataset):
+  uv run examples/yam/convert_yam_data_to_lerobot.py \
+      --args.raw-dirs /data/hang_mug_session1 /data/hang_mug_session2 /data/hang_mug_session3 \
+      --args.repo-id ykorkmaz/yam_hang_mug_all
+
+Episodes are appended in the order the directories are given, so episode_index is contiguous across
+sources and per-source episode names may collide harmlessly. Per-episode prompts are preserved, so
+merging datasets of different tasks yields a correctly multi-task LeRobot dataset. Every source is
+validated to agree on resolution / framerate / cameras before anything is written -- merging
+mismatched sources would otherwise silently produce a dataset whose declared feature shapes lie
+about its videos. The episode_index -> source mapping is written to meta/source_datasets.json.
+
+A directory that has no numeric episode subdirectories is treated as a PARENT of raw datasets and
+descended one level, so --args.raw-dirs /data/processed picks up /data/processed/*/NNNN.
 """
 
 import dataclasses
@@ -63,16 +78,109 @@ MOTORS = [
 
 @dataclasses.dataclass(frozen=True)
 class Args:
-    raw_dir: Path
-    """Path to the raw YAM dataset directory."""
     repo_id: str
     """LeRobot repo ID (e.g., yuzhi/yam_place_lock_simple)."""
+    raw_dirs: tuple[Path, ...] = ()
+    """One or more raw YAM dataset directories, merged into a single dataset in the order given."""
+    raw_dir: Path | None = None
+    """Single raw YAM dataset directory (kept for backwards compatibility; prefer --raw-dirs)."""
     push_to_hub: bool = False
     """Whether to push the dataset to HuggingFace Hub."""
     private: bool = True
     """Whether to create a private repo on HuggingFace Hub."""
     overwrite: bool = False
     """Whether to overwrite the existing dataset."""
+
+    def resolved_raw_dirs(self) -> list[Path]:
+        dirs = list(self.raw_dirs)
+        if self.raw_dir is not None:
+            dirs.insert(0, self.raw_dir)
+        if not dirs:
+            raise SystemExit("Pass --args.raw-dirs <dir> [<dir> ...] (or the legacy --args.raw-dir <dir>).")
+        seen, unique = set(), []
+        for d in dirs:
+            resolved = d.expanduser().resolve()
+            if not resolved.is_dir():
+                raise SystemExit(f"Raw dataset directory does not exist: {resolved}")
+            # Converting the same source twice would silently duplicate every episode.
+            if resolved in seen:
+                raise SystemExit(f"Raw dataset directory given more than once: {resolved}")
+            seen.add(resolved)
+            unique.append(resolved)
+        return unique
+
+
+def find_episode_dirs(root: Path) -> list[Path]:
+    """Episode directories under ``root`` (numeric names, as written by the YAM recorder).
+
+    When ``root`` has no numeric subdirectories it is treated as a PARENT of raw datasets and
+    descended one level, so a whole collection directory can be passed as a single argument.
+    """
+    episodes = sorted(d for d in root.iterdir() if d.is_dir() and d.name.isdigit())
+    if episodes:
+        return episodes
+    nested = []
+    for sub in sorted(d for d in root.iterdir() if d.is_dir()):
+        nested.extend(sorted(d for d in sub.iterdir() if d.is_dir() and d.name.isdigit()))
+    return nested
+
+
+def read_episode_metadata(ep_dir: Path) -> dict:
+    with open(ep_dir / "metadata.json") as f:
+        return json.load(f)
+
+
+def scan_sources(raw_dirs: list[Path]) -> tuple[list[tuple[Path, Path]], tuple[int, int], int, list[str]]:
+    """Enumerate every episode across ``raw_dirs`` and check the sources are mergeable.
+
+    Returns ``(episodes, (height, width), fps, cameras)`` where ``episodes`` is a list of
+    ``(episode_dir, source_dir)`` in conversion order.
+
+    Resolution / framerate / camera set must agree across ALL episodes: the LeRobot feature schema
+    declares one shape and one fps for the whole dataset, so a mismatched source would produce a
+    dataset whose metadata does not describe its own videos (and which trains on silently rescaled
+    frames). Failing here is much cheaper than discovering it after a multi-hour encode.
+    """
+    episodes: list[tuple[Path, Path]] = []
+    resolution: tuple[int, int] | None = None
+    fps: int | None = None
+    cameras: list[str] | None = None
+    reference: Path | None = None
+    mismatches: list[str] = []
+
+    for raw_dir in raw_dirs:
+        found = find_episode_dirs(raw_dir)
+        if not found:
+            raise SystemExit(f"No numeric episode directories found under {raw_dir}")
+        print(f"  {raw_dir}: {len(found)} episodes")
+        for ep_dir in found:
+            if not (ep_dir / "metadata.json").exists():
+                mismatches.append(f"{ep_dir}: no metadata.json")
+                continue
+            meta = read_episode_metadata(ep_dir)
+            ep_res = tuple(int(v) for v in meta.get("resolution", ())) or None
+            ep_fps = int(meta.get("framerate", FPS))
+            ep_cams = sorted(meta.get("cameras", CAMERAS))
+            if resolution is None:
+                resolution, fps, cameras, reference = ep_res, ep_fps, ep_cams, ep_dir
+            else:
+                if ep_res is not None and ep_res != resolution:
+                    mismatches.append(f"{ep_dir}: resolution {ep_res} != {resolution} (from {reference})")
+                if ep_fps != fps:
+                    mismatches.append(f"{ep_dir}: framerate {ep_fps} != {fps} (from {reference})")
+                if ep_cams != cameras:
+                    mismatches.append(f"{ep_dir}: cameras {ep_cams} != {cameras} (from {reference})")
+            episodes.append((ep_dir, raw_dir))
+
+    if mismatches:
+        raise SystemExit(
+            "Raw datasets are not mergeable:\n  " + "\n  ".join(mismatches)
+            + "\nConvert the mismatched sources separately, or re-record them to match."
+        )
+    missing = [c for c in CAMERAS if cameras is not None and c not in cameras]
+    if missing:
+        raise SystemExit(f"Raw datasets are missing required cameras {missing} (have {cameras}).")
+    return episodes, (resolution or (720, 1280)), (fps or FPS), (cameras or list(CAMERAS))
 
 
 def load_lowdim_bulk(ep_dir: Path, num_frames: int) -> np.ndarray:
@@ -147,10 +255,14 @@ def process_episode(
     dataset: LeRobotDataset,
     ep_dir: Path,
     output_dir: Path,
-) -> None:
-    """Process one episode: bulk load lowdim, hardlink images, ffmpeg encode, save."""
-    with open(ep_dir / "metadata.json") as f:
-        metadata = json.load(f)
+    fps: int = FPS,
+) -> str:
+    """Process one episode: bulk load lowdim, hardlink images, ffmpeg encode, save.
+
+    Returns the episode's task prompt. ``fps`` comes from the sources' validated metadata rather
+    than the module constant, so timestamps and the encoded video agree with the recording.
+    """
+    metadata = read_episode_metadata(ep_dir)
 
     num_frames_raw = metadata["num_frames"]
     task = metadata["language"]["prompt"][0]
@@ -179,7 +291,7 @@ def process_episode(
         img_key = f"observation.images.{cam}"
         imgs_dir = tmp_frames_root / img_key / f"episode_{episode_index:06d}"
         video_path = output_dir / dataset.meta.get_video_file_path(episode_index, img_key)
-        encode_video_ffmpeg(imgs_dir, video_path, num_frames, FPS)
+        encode_video_ffmpeg(imgs_dir, video_path, num_frames, fps)
 
     with ThreadPoolExecutor(max_workers=3) as pool:
         list(pool.map(_encode_cam, CAMERAS))
@@ -189,7 +301,7 @@ def process_episode(
     ep_buffer["size"] = num_frames
     ep_buffer["task"] = [task] * num_frames
     ep_buffer["frame_index"] = list(range(num_frames))
-    ep_buffer["timestamp"] = [i / FPS for i in range(num_frames)]
+    ep_buffer["timestamp"] = [i / fps for i in range(num_frames)]
     ep_buffer["observation.state"] = [joints[i] for i in range(num_frames)]
     ep_buffer["action"] = [actions[i] for i in range(num_frames)]
 
@@ -209,13 +321,20 @@ def process_episode(
         if ep_frames_dir.exists():
             shutil.rmtree(ep_frames_dir)
 
+    return task
+
 
 def main(args: Args):
-    raw_dir = args.raw_dir
     repo_id = args.repo_id
+    raw_dirs = args.resolved_raw_dirs()
 
-    ep_dirs = sorted([d for d in raw_dir.iterdir() if d.is_dir() and d.name.isdigit()])
-    print(f"Found {len(ep_dirs)} episodes in {raw_dir}")
+    print(f"Scanning {len(raw_dirs)} raw dataset(s):")
+    ep_dirs_with_source, resolution, fps, cameras = scan_sources(raw_dirs)
+    height, width = resolution
+    print(
+        f"Found {len(ep_dirs_with_source)} episodes total | resolution {height}x{width} | "
+        f"{fps} fps | cameras {cameras}"
+    )
 
     output_dir = HF_LEROBOT_HOME / repo_id
     if output_dir.exists():
@@ -241,13 +360,15 @@ def main(args: Args):
     for cam in CAMERAS:
         features[f"observation.images.{cam}"] = {
             "dtype": "video",
-            "shape": (3, 720, 1280),
+            # Taken from the sources' own metadata (validated identical across them) rather than
+            # hardcoded, so the declared shape always matches the encoded videos.
+            "shape": (3, height, width),
             "names": ["channels", "height", "width"],
         }
 
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
-        fps=FPS,
+        fps=fps,
         robot_type="yam_bimanual",
         features=features,
         use_videos=True,
@@ -257,16 +378,32 @@ def main(args: Args):
     )
 
     skipped: list[tuple[str, str]] = []
-    for ep_dir in tqdm.tqdm(ep_dirs, desc="Converting episodes"):
+    # episode_index -> provenance. Once merged, the LeRobot dataset has no record of which raw
+    # session an episode came from, which makes it impossible to drop or re-weight one source later.
+    provenance: list[dict] = []
+    per_source_counts: dict[str, int] = {str(d): 0 for d in raw_dirs}
+
+    for ep_dir, source_dir in tqdm.tqdm(ep_dirs_with_source, desc="Converting episodes"):
+        label = f"{source_dir.name}/{ep_dir.name}"
         try:
-            process_episode(dataset, ep_dir, output_dir)
+            episode_index = dataset.meta.total_episodes
+            task = process_episode(dataset, ep_dir, output_dir, fps=fps)
+            provenance.append(
+                {
+                    "episode_index": episode_index,
+                    "source_dir": str(source_dir),
+                    "source_episode": ep_dir.name,
+                    "task": task,
+                }
+            )
+            per_source_counts[str(source_dir)] += 1
         except Exception as e:
-            print(f"\nSKIPPING {ep_dir.name}: {e}")
-            skipped.append((ep_dir.name, str(e)))
+            print(f"\nSKIPPING {label}: {e}")
+            skipped.append((label, str(e)))
 
     if skipped:
         print(f"\n{'='*60}")
-        print(f"Skipped {len(skipped)}/{len(ep_dirs)} episodes:")
+        print(f"Skipped {len(skipped)}/{len(ep_dirs_with_source)} episodes:")
         for name, err in skipped:
             print(f"  {name}: {err}")
 
@@ -275,8 +412,20 @@ def main(args: Args):
     if tmp_frames_root.exists():
         shutil.rmtree(tmp_frames_root)
 
+    if provenance:
+        with open(output_dir / "meta" / "source_datasets.json", "w") as f:
+            json.dump(
+                {"sources": [str(d) for d in raw_dirs], "episodes": provenance}, f, indent=2
+            )
+
     print(f"Dataset saved to {output_dir}")
     print(f"Total episodes: {dataset.num_episodes}, Total frames: {dataset.num_frames}")
+    if len(raw_dirs) > 1:
+        print("Episodes per source:")
+        for source, count in per_source_counts.items():
+            print(f"  {count:5d}  {source}")
+        tasks = sorted({p["task"] for p in provenance})
+        print(f"Tasks in the merged dataset ({len(tasks)}): {tasks}")
 
     if args.push_to_hub:
         dataset.push_to_hub(private=args.private)

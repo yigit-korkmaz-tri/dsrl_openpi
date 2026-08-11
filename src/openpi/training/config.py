@@ -558,6 +558,40 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class FlowMileParams:
+    """Flow-MILE hyperparameters (see scripts/train.py flow_mile loss).
+
+    Enables the MILE intervention-probit objective on top of pi0/pi0.5's flow-matching loss. When a
+    TrainConfig sets ``flow_mile``, train_step uses the Flow-MILE loss instead of plain BC:
+
+        total = BC(labels {1,2})  +  lambda_intervention * BCE_probit(labels {0,1})
+
+    Assumes ``condition_intervention_on_action=True`` and ``condition_nonintervention_on_robot=True``
+    (no proximal loss, no score-gap normalization) per the porting spec. Requires the data pipeline
+    to carry a per-frame ``intervention`` label (0=policy, 1=human, 2=offline) -- use a
+    LeRobotLiberoHitlDataConfig.
+    """
+
+    # Weight of the intervention BCE term.
+    lambda_intervention: float = 1.0
+    # Probit slope beta on the score gap.
+    probit_scale: float = 1.0
+    # Probit threshold offset c (higher => human intervenes less readily).
+    intervention_cost: float = 0.0
+    # K: number of action chunks sampled per policy (rollout pi_0 and online) for the probit baseline
+    # / marginal. Each is a full reverse-ODE sample -- keep small for pi0 (expensive).
+    num_samples: int = 4
+    # (t, x0) draws used to estimate each per-sample flow-matching loss ell(a,s).
+    score_mc_samples: int = 1
+    # w: weight on the rollout baseline in the score gap (1.0 = standard MILE).
+    expected_rollout_score_weight: float = 1.0
+    # Euler steps for the reverse-ODE MC sampling.
+    num_sample_steps: int = 10
+    # Use reference-relative score ell = flow_loss_0 - flow_loss_theta (vs plain -flow_loss_theta).
+    reference_relative_score: bool = True
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -586,6 +620,10 @@ class TrainConfig:
 
     # Specifies which weights should be frozen.
     freeze_filter: tyro.conf.Suppress[Filter] = dataclasses.field(default_factory=nnx.Nothing)
+
+    # When set, train_step uses the Flow-MILE objective (intervention probit + BC) instead of plain
+    # flow-matching BC. Requires the data config to carry a per-frame ``intervention`` label.
+    flow_mile: FlowMileParams | None = None
 
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
@@ -898,14 +936,13 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
     ),
-    # Flow-MILE, LoRA — SCAFFOLD ONLY. Uses the intervention-preserving data config so the per-frame
-    # label reaches the model-input transforms. The Flow-MILE probit/BCE loss itself is NOT wired yet:
-    # finishing it requires (a) carrying `intervention` past create_data_loader's (Observation, Actions)
-    # hand-off, (b) a frozen rollout-policy snapshot + K sampled/scored action chunks and the probit in
-    # train_step/pi0.py, and (c) MILE hyperparameters on a TrainConfig subclass. See the plan and the
-    # in-house robometer_policy_learning/algorithms/flow_mile spec. Running this today trains like
-    # HG-DAgger (the extra label is currently ignored downstream) — it exists to pin the config name +
-    # data path so the loss can be dropped in without a config churn.
+    # Flow-MILE, LoRA. Trains pi0.5 on an exported HITL LeRobot dataset with the MILE objective:
+    #   total = BC(labels {1,2})  +  lambda * BCE_probit(labels {0,1})
+    # using pi0.5's flow-matching loss as the log-prob proxy (see scripts/train.py flow-mile loss).
+    # Needs the intervention-preserving data config (LeRobotLiberoHitlDataConfig) + a frozen
+    # rollout-policy snapshot (the init/collection weights). Assumes condition_intervention_on_action
+    # and condition_nonintervention_on_robot. MILE sampling is expensive (K reverse-ODE samples/step
+    # per policy) so batch_size / flow_mile.num_samples are kept small; tune per GPU.
     TrainConfig(
         name="pi05_libero_flow_mile_lora",
         model=pi0_config.Pi0Config(
@@ -929,12 +966,22 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
-        batch_size=16,
+        batch_size=8,
         num_train_steps=5_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=200, peak_lr=5e-5, decay_steps=5_000, decay_lr=5e-5
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        flow_mile=FlowMileParams(
+            lambda_intervention=1.0,
+            probit_scale=1.0,
+            intervention_cost=0.0,
+            num_samples=4,
+            score_mc_samples=1,
+            expected_rollout_score_weight=1.0,
+            num_sample_steps=10,
+            reference_relative_score=True,
+        ),
     ),
     #
     # Fine-tuning Aloha configs.
@@ -1152,6 +1199,49 @@ _CONFIGS = [
         num_train_steps=30_000,
         batch_size=32,
         num_workers=4,
+    ),
+    TrainConfig(
+        name="pi05_yam_pickbanana",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=SimpleDataConfig(
+            repo_id="robot-lab/pickup_banana_yam",
+            assets=AssetsConfig(asset_id="pi05_yam_pickbanana"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                # Map LeRobot dataset feature keys -> keys expected by YAMInputs.
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.scene_camera",
+                                "observation/image_left_wrist": "observation.images.left_wrist_camera",
+                                "observation/image_right_wrist": "observation.images.right_wrist_camera",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                # LeRobot dataset stores actions under the singular key "action".
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=30_000,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

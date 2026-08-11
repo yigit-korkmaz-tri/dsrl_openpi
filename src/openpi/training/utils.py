@@ -22,6 +22,12 @@ class TrainState:
     ema_decay: float | None = struct.field(pytree_node=False)
     ema_params: nnx.State | None = None
 
+    # Frozen rollout-policy params (pi_0) for Flow-MILE: a snapshot of the initial (collection-policy)
+    # weights, used to sample the baseline action chunks and to score the reference-relative
+    # flow-matching loss. None for non-Flow-MILE configs. Fixed for the whole training run (each
+    # openpi run is one HITL round starting from that round's collection checkpoint).
+    rollout_params: nnx.State | None = None
+
 
 @at.typecheck
 def tree_to_info(tree: at.PyTree, interp_func: Callable[[Any], str] = str) -> str:

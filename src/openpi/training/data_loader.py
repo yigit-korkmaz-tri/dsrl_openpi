@@ -548,4 +548,11 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            obs = _model.Observation.from_dict(batch)
+            # Flow-MILE: carry the per-frame ``intervention`` label (0=policy, 1=human, 2=offline)
+            # alongside (Observation, Actions) when the data config provides it (Observation.from_dict
+            # drops it). train_step unpacks the 3-tuple only for flow_mile configs.
+            if "intervention" in batch:
+                yield obs, batch["actions"], batch["intervention"]
+            else:
+                yield obs, batch["actions"]
