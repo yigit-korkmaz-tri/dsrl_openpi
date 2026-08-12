@@ -1279,6 +1279,124 @@ _CONFIGS = [
         ema_decay=0.999,
         num_train_steps=30_000,
     ),
+    TrainConfig(
+        name="pi05_yam_mugontree",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=SimpleDataConfig(
+            repo_id="robot-lab/hang_mug_on_mug_tree",
+            assets=AssetsConfig(asset_id="pi05_yam_mugontree"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                # Map LeRobot dataset feature keys -> keys expected by YAMInputs.
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head": "observation.images.scene_camera",
+                                "observation/image_left_wrist": "observation.images.left_wrist_camera",
+                                "observation/image_right_wrist": "observation.images.right_wrist_camera",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                # LeRobot dataset stores actions under the singular key "action".
+                action_sequence_keys=("action",),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_yam_mugontree_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=25,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=SimpleDataConfig(
+            repo_id="ykorkmaz/yam_hang_mug_on_mug_tree",
+            # Must match the assets subdir written into the checkpoint by the
+            # training run:
+            # checkpoint_dir/assets/<asset_id>/norm_stats.json
+            assets=AssetsConfig(asset_id="pi05_yam_mugontree_lora"),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[
+                    yam_policy.YAMInputs(
+                        model_type=model.model_type,
+                    )
+                ],
+                outputs=[yam_policy.YAMOutputs()],
+            ),
+            base_config=DataConfig(
+                # Map LeRobot dataset feature keys -> keys expected by YAMInputs.
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image_head":
+                                    "observation.images.scene_camera",
+                                "observation/image_left_wrist":
+                                    "observation.images.left_wrist_camera",
+                                "observation/image_right_wrist":
+                                    "observation.images.right_wrist_camera",
+                                "observation/state":
+                                    "observation.state",
+                                "actions":
+                                    "action",
+                                "prompt":
+                                    "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+                # LeRobot dataset stores actions under singular key "action".
+                action_sequence_keys=("action",),
+            ),
+        ),
+        # Initialize from the normal full π0.5 base checkpoint.
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        # LoRA: freeze the non-LoRA parameters.
+        # IMPORTANT: this Pi0Config must match `model=` above.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(
+            clip_gradient_norm=1.0,
+        ),
+        # EMA should be disabled for LoRA fine-tuning.
+        ema_decay=None,
+        num_train_steps=30_000,
+    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
