@@ -112,8 +112,20 @@ def init_train_state(
             ema_decay=config.ema_decay,
             ema_params=None if config.ema_decay is None else params,
             # Flow-MILE: snapshot the initial (collection-policy) weights as the frozen rollout policy
-            # pi_0. Fixed for the whole run. None (and no memory cost) for non-Flow-MILE configs.
-            rollout_params=params if config.flow_mile is not None else None,
+            # pi_0. Fixed for the whole run. None (and no memory cost) for non-Flow-MILE configs, and
+            # ALSO dropped when the rollout baseline comes from a stored pool AND the score is not
+            # reference-relative AND the anchor loss is off -- then the frozen policy is provably unused
+            # (the OOM fix). The anchor loss needs v_0, so it keeps the resident copy.
+            rollout_params=(
+                params
+                if config.flow_mile is not None
+                and not (
+                    config.flow_mile.use_stored_rollout_samples
+                    and not config.flow_mile.reference_relative_score
+                    and config.flow_mile.anchor_loss_weight <= 0.0
+                )
+                else None
+            ),
         )
 
     train_state_shape = jax.eval_shape(init, init_rng)
@@ -169,43 +181,83 @@ def _flow_loss(model: _model.BaseModel, rng: at.KeyArrayLike, observation, actio
     return jnp.mean(jnp.stack([one(r) for r in jax.random.split(rng, score_mc)], axis=0), axis=0)
 
 
-def _flow_mile_grads(config, online_model, state, rng, observation, actions, interventions, diff_state):
+def _flow_mile_grads(config, online_model, state, rng, observation, actions, interventions,
+                     stored_rollout_samples, diff_state):
     """Compute the Flow-MILE loss + grads w.r.t. the online model's trainable params.
 
     Everything independent of the online params theta (all sampling; the frozen-policy reference
     flow-losses) is precomputed OUTSIDE value_and_grad as constants, so loss_fn runs only the online
     model and stays a single-module grad (like the standard path). Returns (loss, aux, grads).
+
+    The K frozen-rollout baseline chunks come either from the RESIDENT frozen policy
+    (``sample_actions`` every step) or, when ``fm.use_stored_rollout_samples``, from a pool
+    precomputed at collection and threaded in as ``stored_rollout_samples`` ``[B,P,H,A]`` (avoids
+    keeping/sampling the rollout policy on GPU). The resident policy is also needed for the
+    reference-relative flow-losses, so it is only dropped when stored samples are used AND
+    ``reference_relative_score`` is False (see ``init_train_state`` gating).
     """
     fm = config.flow_mile
     k = fm.num_samples
     b = actions.shape[0]
     ah, ad = actions.shape[-2], actions.shape[-1]
     interventions = jnp.reshape(interventions, (b,)).astype(jnp.float32)
+    ref_rel = fm.reference_relative_score
+    use_stored = fm.use_stored_rollout_samples
 
-    rng_rs, rng_os, rng_r, rng_o, rng_l, rng_bc = jax.random.split(rng, 6)
+    rng_rs, rng_os, rng_r, rng_o, rng_l, rng_bc, rng_an = jax.random.split(rng, 7)
 
-    rollout_model = nnx.merge(state.model_def, state.rollout_params)  # frozen pi_0 (shares state arrays)
-    rollout_model.eval()
+    # The resident frozen policy is materialized only when actually needed: to sample the rollout
+    # baseline (when NOT using stored samples) and/or for the reference-relative flow-losses.
+    rollout_model = None
+    if state.rollout_params is not None:
+        rollout_model = nnx.merge(state.model_def, state.rollout_params)  # frozen pi_0 (shares arrays)
+        rollout_model.eval()
 
     obs_k = _tile_obs(observation, k)  # [K*B, ...]
-    # Sample K chunks per state from the frozen rollout policy and the online policy (stop-grad).
-    rollout_samples = jax.lax.stop_gradient(
-        rollout_model.sample_actions(
-            rng_rs, obs_k, num_steps=fm.num_sample_steps, noise=jax.random.normal(rng_rs, (k * b, ah, ad))
+    # K frozen-rollout baseline chunks (stop-grad): stored pool or fresh from the frozen policy.
+    if use_stored:
+        pool = stored_rollout_samples  # [B, P, H, A] (already normalized+padded like actions)
+        p = pool.shape[1]
+        # Random K-of-P per row; take_along_axis keeps it JIT-friendly (requires P >= K).
+        idx = jax.random.randint(rng_rs, (b, k), 0, p)  # [B, K]
+        sel = jnp.take_along_axis(pool, idx[:, :, None, None], axis=1)  # [B, K, H, A]
+        # transpose->reshape (NOT plain reshape) to match _tile_obs order (row j*B + b -> sample j).
+        rollout_samples = jax.lax.stop_gradient(jnp.transpose(sel, (1, 0, 2, 3)).reshape(k * b, ah, ad))
+    else:
+        rollout_samples = jax.lax.stop_gradient(
+            rollout_model.sample_actions(
+                rng_rs, obs_k, num_steps=fm.num_sample_steps, noise=jax.random.normal(rng_rs, (k * b, ah, ad))
+            )
         )
-    )
     online_samples = jax.lax.stop_gradient(
         online_model.sample_actions(
             rng_os, obs_k, num_steps=fm.num_sample_steps, noise=jax.random.normal(rng_os, (k * b, ah, ad))
         )
     )
-    # Frozen-policy (reference) flow losses -- constants (no theta dependence).
-    ref_rollout = jax.lax.stop_gradient(_flow_loss(rollout_model, rng_r, obs_k, rollout_samples, fm.score_mc_samples))
-    ref_online = jax.lax.stop_gradient(_flow_loss(rollout_model, rng_o, obs_k, online_samples, fm.score_mc_samples))
-    ref_logged = jax.lax.stop_gradient(_flow_loss(rollout_model, rng_l, observation, actions, fm.score_mc_samples))
+    # Frozen-policy (reference) flow losses -- constants (no theta dependence). Needed only for the
+    # reference-relative score; skipped (and the frozen policy untouched) otherwise.
+    ref_rollout = ref_online = ref_logged = None
+    if ref_rel:
+        ref_rollout = jax.lax.stop_gradient(_flow_loss(rollout_model, rng_r, obs_k, rollout_samples, fm.score_mc_samples))
+        ref_online = jax.lax.stop_gradient(_flow_loss(rollout_model, rng_o, obs_k, online_samples, fm.score_mc_samples))
+        ref_logged = jax.lax.stop_gradient(_flow_loss(rollout_model, rng_l, observation, actions, fm.score_mc_samples))
 
-    ref_rel, w, beta, c, lam = (
-        fm.reference_relative_score,
+    # Anchor loss constants: the frozen field v_0(x_t,t,s) on the SAME (x_t, t) both policies see.
+    # Reuses the first J=min(anchor_mc, K) rollout chunks (+ their tiled obs); the noisy interpolant
+    # x_t is built here (constant) so online/frozen velocities are compared at identical inputs.
+    anchor_obs = anchor_x_t = anchor_time = ref_anchor_v = None
+    if fm.anchor_loss_weight > 0.0:
+        j = min(fm.anchor_monte_carlo_samples, k)
+        rng_an_noise, rng_an_time = jax.random.split(rng_an, 2)
+        anchor_actions = rollout_samples[: j * b]  # [J*B, ah, ad], stop-grad (from rollout policy)
+        anchor_obs = jax.tree.map(lambda x: x[: j * b], obs_k)
+        anchor_noise = jax.random.normal(rng_an_noise, anchor_actions.shape)
+        anchor_time = jax.random.beta(rng_an_time, 1.5, 1, anchor_actions.shape[:-2]) * 0.999 + 0.001
+        te = anchor_time[..., None, None]
+        anchor_x_t = te * anchor_noise + (1.0 - te) * anchor_actions  # openpi convention (t=1 -> noise)
+        ref_anchor_v = jax.lax.stop_gradient(rollout_model.predict_velocity(anchor_obs, anchor_x_t, anchor_time))
+
+    w, beta, c, lam = (
         fm.expected_rollout_score_weight,
         fm.probit_scale,
         fm.intervention_cost,
@@ -252,10 +304,18 @@ def _flow_mile_grads(config, online_model, state, rng, observation, actions, int
         bc_per = jnp.mean(model.compute_loss(bc_rng, observation, actions, train=True), axis=-1)  # [B]
         bc = jnp.sum(bc_per * action_mask) / jnp.clip(jnp.sum(action_mask), 1.0, None)
 
-        total = bc + lam * bce
+        # Anchor loss: match the online velocity field to the frozen field at the same (x_t, t) on
+        # rollout-sampled actions -- ||v_theta - v_0||^2 (grads flow through v_theta only).
+        anchor = jnp.zeros((), dtype=bc.dtype)
+        if fm.anchor_loss_weight > 0.0:
+            th_anchor_v = model.predict_velocity(anchor_obs, anchor_x_t, anchor_time)
+            anchor = jnp.mean(jnp.square(th_anchor_v - ref_anchor_v))
+
+        total = bc + lam * bce + fm.anchor_loss_weight * anchor
         aux = {
             "bc_loss": bc,
             "bce_loss": bce,
+            "anchor_loss": anchor,
             "intervention_prob_mean": jnp.mean(probs),
             "intervention_frac": jnp.mean(label1.astype(jnp.float32)),
             "expected_rollout_score_mean": jnp.mean(expected_rollout_score),
@@ -280,9 +340,16 @@ def train_step(
     diff_state = nnx.DiffState(0, config.trainable_filter)
 
     if config.flow_mile is not None:
-        observation, actions, interventions = batch
+        # 4-tuple when the data config provides a stored rollout pool (use_stored_rollout_samples),
+        # else the 3-tuple (frozen policy sampled on-the-fly).
+        if len(batch) == 4:
+            observation, actions, interventions, stored_rollout_samples = batch
+        else:
+            observation, actions, interventions = batch
+            stored_rollout_samples = None
         loss, extra_info, grads = _flow_mile_grads(
-            config, model, state, train_rng, observation, actions, interventions, diff_state
+            config, model, state, train_rng, observation, actions, interventions,
+            stored_rollout_samples, diff_state
         )
     else:
         observation, actions = batch

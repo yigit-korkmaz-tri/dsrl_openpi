@@ -427,6 +427,7 @@ class LeRobotLiberoHitlDataConfig(DataConfigFactory):
                         "actions": "actions",
                         "prompt": "prompt",
                         "intervention": "intervention",  # HITL: keep the per-frame label
+                        "rollout_samples": "rollout_samples",  # Flow-MILE: frozen-rollout baseline pool
                     }
                 )
             ]
@@ -442,8 +443,17 @@ class LeRobotLiberoHitlDataConfig(DataConfigFactory):
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
         model_transforms = ModelTransformFactory()(model_config)
+        base = self.create_base_config(assets_dirs, model_config)
+        # Flow-MILE: normalize the rollout-sample pool with the SAME action stats (the existing
+        # Normalize transform normalizes any key present in norm_stats, broadcasting over the pool/
+        # horizon dims). Guard on "actions" so this is a no-op at compute_norm_stats time (norm_stats
+        # is None there). The aliased NormStats carries q01/q99 so quantile normalization applies.
+        norm_stats = base.norm_stats
+        if norm_stats is not None and "actions" in norm_stats:
+            norm_stats = {**norm_stats, "rollout_samples": norm_stats["actions"]}
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base,
+            norm_stats=norm_stats,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -589,6 +599,22 @@ class FlowMileParams:
     num_sample_steps: int = 10
     # Use reference-relative score ell = flow_loss_0 - flow_loss_theta (vs plain -flow_loss_theta).
     reference_relative_score: bool = True
+    # Anchor loss: match the online velocity field to the frozen rollout field on rollout-sampled
+    # actions -- E_{s,a0~pi_0,t,x0} ||v_theta(a0_t,t,s) - v_0(a0_t,t,s)||^2. Pins the online policy's
+    # score of rollout-like actions to pi_0's, countering the drift that inflates the intervention
+    # probability. 0.0 disables it. NOTE: >0 keeps the resident frozen policy (needs v_0), i.e. does
+    # NOT compose with the use_stored_rollout_samples memory saving.
+    anchor_loss_weight: float = 0.0
+    # Rollout-policy action chunks the anchor loss matches on (reuses the probit's K samples; capped
+    # at num_samples). Must be >= 1.
+    anchor_monte_carlo_samples: int = 1
+    # If True, read the K frozen-rollout baseline chunks from a per-frame pool precomputed at
+    # collection (data field ``rollout_samples``; needs a LeRobotLiberoHitlDataConfig repo exported
+    # from HDF5 collected with hitl.rollout_pool_size>0) instead of sampling a resident frozen policy
+    # every step. Combined with ``reference_relative_score=False`` this drops the frozen rollout-policy
+    # param copy entirely (the OOM fix); with reference_relative_score=True the frozen copy is still
+    # kept for the reference flow-losses. Pool size P must be >= num_samples (K).
+    use_stored_rollout_samples: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -916,6 +942,10 @@ _CONFIGS = [
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",  # override with the exported HITL repo per round
+            # FIXED asset_id so norm stats live at a stable key regardless of the per-round --data.repo-id
+            # override -- otherwise train bakes checkpoint/assets/<exported_repo>/ but eval (no override)
+            # looks under the default repo_id and can't find them.
+            assets=AssetsConfig(asset_id="libero_hitl"),
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
@@ -954,6 +984,8 @@ _CONFIGS = [
         ),
         data=LeRobotLiberoHitlDataConfig(
             repo_id="physical-intelligence/libero",  # override with the exported HITL repo per round
+            # FIXED asset_id (see pi05_libero_hitl_lora) so norm stats stay findable across repo overrides.
+            assets=AssetsConfig(asset_id="libero_flow_mile"),
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
@@ -976,11 +1008,15 @@ _CONFIGS = [
             lambda_intervention=1.0,
             probit_scale=1.0,
             intervention_cost=0.0,
+            anchor_loss_weight=0.01,
             num_samples=4,
             score_mc_samples=1,
             expected_rollout_score_weight=1.0,
             num_sample_steps=10,
             reference_relative_score=True,
+            # Read the frozen-rollout baseline from a collection-time pool (needs a HITL repo exported
+            # from HDF5 collected with hitl.rollout_pool_size>=num_samples).
+            use_stored_rollout_samples=True,
         ),
     ),
     #

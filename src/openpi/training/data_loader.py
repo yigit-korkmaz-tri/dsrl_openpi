@@ -549,10 +549,13 @@ class DataLoaderImpl(DataLoader):
     def __iter__(self):
         for batch in self._data_loader:
             obs = _model.Observation.from_dict(batch)
-            # Flow-MILE: carry the per-frame ``intervention`` label (0=policy, 1=human, 2=offline)
-            # alongside (Observation, Actions) when the data config provides it (Observation.from_dict
-            # drops it). train_step unpacks the 3-tuple only for flow_mile configs.
-            if "intervention" in batch:
+            # Flow-MILE: carry the per-frame ``intervention`` label (0=policy, 1=human, 2=offline) and,
+            # when present, the frozen-rollout baseline pool ``rollout_samples`` [B,P,H,A] alongside
+            # (Observation, Actions) — Observation.from_dict drops both. train_step unpacks the extended
+            # tuple only for flow_mile configs.
+            if "rollout_samples" in batch:
+                yield obs, batch["actions"], batch["intervention"], batch["rollout_samples"]
+            elif "intervention" in batch:
                 yield obs, batch["actions"], batch["intervention"]
             else:
                 yield obs, batch["actions"]

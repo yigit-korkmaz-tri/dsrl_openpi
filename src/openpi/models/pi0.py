@@ -213,6 +213,31 @@ class Pi0(_model.BaseModel):
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
+    def predict_velocity(
+        self,
+        observation: _model.Observation,
+        x_t: _model.Actions,
+        timestep: at.Float[at.Array, " b"],
+        *,
+        train: bool = False,
+    ) -> at.Float[at.Array, "*b ah ad"]:
+        """Raw flow-matching velocity field ``v(x_t, t | obs)`` -- the quantity ``compute_loss``
+        regresses toward the target ``u_t``, exposed for callers that need to compare two policies'
+        fields at the SAME ``(x_t, t)`` (e.g. Flow-MILE's anchor loss). Unlike ``compute_loss`` it does
+        NOT sample noise/time; the caller supplies ``x_t`` and ``timestep``. Observation is preprocessed
+        with ``train=False`` by default (deterministic -> two policies see identical inputs)."""
+        observation = _model.preprocess_observation(None, observation, train=train)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, timestep)
+        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        attn_mask = make_attn_mask(input_mask, ar_mask)
+        positions = jnp.cumsum(input_mask, axis=1) - 1
+        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+        )
+        return self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
     @override
     def sample_actions(
         self,

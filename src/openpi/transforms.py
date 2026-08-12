@@ -344,18 +344,10 @@ class PadStatesAndActions(DataTransformFn):
         data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
-        return data
-
-@dataclasses.dataclass(frozen=True)
-class PadStatesAndActions(DataTransformFn):
-    """Zero-pads states and actions to the model action dimension."""
-
-    model_action_dim: int
-
-    def __call__(self, data: DataDict) -> DataDict:
-        data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
-        if "actions" in data:
-            data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+        # Flow-MILE: pad the rollout-sample pool [P,H,7] -> [P,H,model_action_dim] like actions (last
+        # axis), so the stored baseline lives in the same normalized+padded space as `actions`.
+        if "rollout_samples" in data:
+            data["rollout_samples"] = pad_to_dim(data["rollout_samples"], self.model_action_dim, axis=-1)
         return data
 
 

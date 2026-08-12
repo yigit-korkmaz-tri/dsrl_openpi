@@ -114,7 +114,11 @@ def main(config_name: str, repo_id: str | None = None, max_frames: int | None = 
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    # Write under the ASSET id, not the repo id: training (create_base_config._load_norm_stats) and the
+    # trained-policy loader both read norm stats from assets_dirs/<asset_id>, and save_state bakes them
+    # into the checkpoint under <asset_id>. For configs without an explicit asset_id this is identical
+    # to repo_id; for the HITL configs (fixed asset_id) it keeps a repo-override run's stats findable.
+    output_path = config.assets_dirs / data_config.asset_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

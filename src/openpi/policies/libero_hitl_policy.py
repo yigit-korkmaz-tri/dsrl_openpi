@@ -64,5 +64,9 @@ class LiberoHitlInputs(transforms.DataTransformFn):
         # HITL addition: carry the per-frame intervention label (0/1/2) forward for the HITL loss.
         if "intervention" in data:
             inputs["intervention"] = data["intervention"]
+        # Flow-MILE: carry the frozen-rollout baseline pool [P,H,7] forward. Normalized (via the
+        # aliased action stats) + padded to model action_dim by the downstream transforms, like actions.
+        if "rollout_samples" in data:
+            inputs["rollout_samples"] = data["rollout_samples"]
 
         return inputs
