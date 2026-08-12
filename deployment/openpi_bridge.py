@@ -23,17 +23,16 @@ Usage (server + bridge)::
         --action_hz 50.0 \\
         --host localhost --port 8000 \\
         --action_horizon 10 \\
+        --realtime_chunking \\
+        --replan_margin 5 \\
         --prompt "pick up the lock and put it into the box"
 
 OpenPI 14D layout: [left_joint(6), left_grip(1), right_joint(6), right_grip(1)]
 Raiden 14D layout: [right_joint(6), right_grip(1), left_joint(6), left_grip(1)]
 """
 
-from typing import Optional
-
 import cv2
 import numpy as np
-
 from raiden.inference import ModelBridge
 
 MODEL_IMG_SIZE = 224
@@ -46,6 +45,19 @@ _CAM_MAP: dict[str, str] = {
 }
 
 
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in ("1", "true", "t", "yes", "y", "on"):
+            return True
+        if value in ("0", "false", "f", "no", "n", "off"):
+            return False
+        raise ValueError(f"Invalid boolean value: {value!r}")
+    return bool(value)
+
+
 def _raiden_to_openpi_state(
     r_joint_pos: np.ndarray,
     l_joint_pos: np.ndarray,
@@ -56,12 +68,14 @@ def _raiden_to_openpi_state(
             l_joint_pos = [l_joints(6), l_grip(1)]
     OpenPI: [l_joints(6), l_grip(1), r_joints(6), r_grip(1)]
     """
-    return np.concatenate([
-        l_joint_pos[:6],
-        l_joint_pos[6:7],
-        r_joint_pos[:6],
-        r_joint_pos[6:7],
-    ]).astype(np.float32)
+    return np.concatenate(
+        [
+            l_joint_pos[:6],
+            l_joint_pos[6:7],
+            r_joint_pos[:6],
+            r_joint_pos[6:7],
+        ]
+    ).astype(np.float32)
 
 
 def _openpi_action_to_raiden(action_14d: np.ndarray) -> np.ndarray:
@@ -70,10 +84,12 @@ def _openpi_action_to_raiden(action_14d: np.ndarray) -> np.ndarray:
     OpenPI: [l_joints(6), l_grip(1), r_joints(6), r_grip(1)]
     Raiden: [r_joints(6), r_grip(1), l_joints(6), l_grip(1)]
     """
-    return np.concatenate([
-        action_14d[7:14],   # right joints (6) + right gripper (1)
-        action_14d[0:7],    # left joints (6) + left gripper (1)
-    ]).astype(np.float32)
+    return np.concatenate(
+        [
+            action_14d[7:14],  # right joints (6) + right gripper (1)
+            action_14d[0:7],  # left joints (6) + left gripper (1)
+        ]
+    ).astype(np.float32)
 
 
 class OpenPiBridge(ModelBridge):
@@ -83,9 +99,19 @@ class OpenPiBridge(ModelBridge):
     raiden observations and OpenPI's expected input format.
     """
 
-    def __init__(self, action_horizon: int = 10):
+    def __init__(
+        self,
+        action_horizon: int = 10,
+        *,
+        realtime_chunking: bool = False,
+        replan_margin: int | None = None,
+        chunk_overrun_behavior: str = "hold",
+    ):
         self._broker = None
         self._action_horizon = action_horizon
+        self._realtime_chunking = realtime_chunking
+        self._replan_margin = replan_margin
+        self._chunk_overrun_behavior = chunk_overrun_behavior
         self._prompt: str = ""
         self._step = 0
         self._n_infer = 0
@@ -101,6 +127,10 @@ class OpenPiBridge(ModelBridge):
             host: Server host (default: "localhost").
             port: Server port (default: 8000).
             action_horizon: Number of actions to execute per inference call.
+            realtime_chunking: Whether to prefetch the next chunk in the background.
+            replan_margin: Start prefetching when this many actions remain.
+            chunk_overrun_behavior: "hold" repeats the last action if inference overruns;
+                "block" waits for the next chunk.
             prompt: Language instruction for the task.
         """
         from openpi_client import action_chunk_broker
@@ -109,6 +139,10 @@ class OpenPiBridge(ModelBridge):
         host = kwargs.get("host", "localhost")
         port = int(kwargs.get("port", 8000))
         action_horizon = int(kwargs.get("action_horizon", self._action_horizon))
+        realtime_chunking = _as_bool(kwargs.get("realtime_chunking", self._realtime_chunking))
+        replan_margin = kwargs.get("replan_margin", self._replan_margin)
+        replan_margin = int(replan_margin) if replan_margin is not None else max(1, action_horizon // 2)
+        chunk_overrun_behavior = kwargs.get("chunk_overrun_behavior", self._chunk_overrun_behavior)
         self._prompt = kwargs.get("prompt", "")
 
         print(f"[openpi_bridge] Connecting to server at {host}:{port}")
@@ -117,11 +151,24 @@ class OpenPiBridge(ModelBridge):
         metadata = ws_policy.get_server_metadata()
         print(f"[openpi_bridge] Server metadata: {metadata}")
 
-        self._broker = action_chunk_broker.ActionChunkBroker(
-            policy=ws_policy,
-            action_horizon=action_horizon,
-        )
-        print(f"[openpi_bridge] Ready (action_horizon={action_horizon})")
+        if realtime_chunking:
+            self._broker = action_chunk_broker.RealTimeActionChunkBroker(
+                policy=ws_policy,
+                action_horizon=action_horizon,
+                replan_margin=replan_margin,
+                exhausted_behavior=chunk_overrun_behavior,
+            )
+            print(
+                "[openpi_bridge] Ready "
+                f"(realtime_chunking=True, action_horizon={action_horizon}, "
+                f"replan_margin={replan_margin}, overrun={chunk_overrun_behavior})"
+            )
+        else:
+            self._broker = action_chunk_broker.ActionChunkBroker(
+                policy=ws_policy,
+                action_horizon=action_horizon,
+            )
+            print(f"[openpi_bridge] Ready (realtime_chunking=False, action_horizon={action_horizon})")
 
     def reset(self) -> None:
         """Reset action chunk buffer."""
@@ -154,7 +201,7 @@ class OpenPiBridge(ModelBridge):
                 f"avg={self._t_infer_sum / self._step:.1f}ms"
             )
 
-        actions = result["actions"]  # (14,) from ActionChunkBroker
+        actions = result["actions"]  # (14,) single-step broker output
         return _openpi_action_to_raiden(actions)
 
     def _preprocess(self, obs) -> dict:
@@ -171,12 +218,8 @@ class OpenPiBridge(ModelBridge):
             obs_dict[obs_key] = rgb  # uint8 [224, 224, 3]
 
         # State: assemble 14D from raiden proprios
-        r_pos = obs.proprios.get(
-            "follower_r_joint_pos", np.zeros(7, dtype=np.float32)
-        )
-        l_pos = obs.proprios.get(
-            "follower_l_joint_pos", np.zeros(7, dtype=np.float32)
-        )
+        r_pos = obs.proprios.get("follower_r_joint_pos", np.zeros(7, dtype=np.float32))
+        l_pos = obs.proprios.get("follower_l_joint_pos", np.zeros(7, dtype=np.float32))
         obs_dict["observation/state"] = _raiden_to_openpi_state(r_pos, l_pos)
 
         # Language prompt
@@ -194,13 +237,29 @@ class OpenPiBridge(ModelBridge):
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="Deploy OpenPI Pi0.5 policy on YAM robot"
-    )
+    parser = argparse.ArgumentParser(description="Deploy OpenPI Pi0.5 policy on YAM robot")
     parser.add_argument("--ckpt_path", default="unused", help="Unused (server loads model)")
     parser.add_argument("--host", default="localhost", help="OpenPI server host")
     parser.add_argument("--port", type=int, default=8000, help="OpenPI server port")
     parser.add_argument("--action_horizon", type=int, default=10, help="Actions per inference")
+    parser.add_argument(
+        "--realtime_chunking",
+        action="store_true",
+        default=False,
+        help="Prefetch the next action chunk while executing the current one.",
+    )
+    parser.add_argument(
+        "--replan_margin",
+        type=int,
+        default=None,
+        help="Start background inference when this many actions remain. Defaults to half the action horizon.",
+    )
+    parser.add_argument(
+        "--chunk_overrun_behavior",
+        default="hold",
+        choices=["hold", "block"],
+        help="Behavior if the current chunk is exhausted before the next chunk is ready.",
+    )
     parser.add_argument("--action_hz", type=float, default=50.0)
     parser.add_argument("--prompt", default="", help="Language instruction")
     parser.add_argument("--camera_config_file", default="./config/camera_config.json")
@@ -212,7 +271,12 @@ def main():
 
     from raiden.inference import RaidenInferenceLoop
 
-    bridge = OpenPiBridge(action_horizon=args.action_horizon)
+    bridge = OpenPiBridge(
+        action_horizon=args.action_horizon,
+        realtime_chunking=args.realtime_chunking,
+        replan_margin=args.replan_margin,
+        chunk_overrun_behavior=args.chunk_overrun_behavior,
+    )
 
     loop = RaidenInferenceLoop(
         bridge=bridge,
@@ -222,6 +286,9 @@ def main():
             "host": args.host,
             "port": args.port,
             "action_horizon": args.action_horizon,
+            "realtime_chunking": args.realtime_chunking,
+            "replan_margin": args.replan_margin,
+            "chunk_overrun_behavior": args.chunk_overrun_behavior,
             "prompt": args.prompt,
         },
         camera_config_file=args.camera_config_file,
