@@ -4,7 +4,7 @@ import dataclasses
 import enum
 import logging
 import pathlib
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeAlias, TypeVar
 
 import augmax
 from flax import nnx
@@ -206,6 +206,54 @@ def preprocess_observation(
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
     )
+
+
+PrefixAttentionSchedule: TypeAlias = Literal["linear", "exp", "ones", "zeros"]
+
+
+def get_prefix_weights(
+    start: int, end: int, total: int, schedule: PrefixAttentionSchedule = "exp"
+) -> np.ndarray:
+    """Per-action guidance weights for real-time chunking (RTC).
+
+    Deliberately computed in NUMPY on the host, not in JAX: the weights are the only place the
+    RTC schedule (a string) and the integer delay/horizon enter the sampler, and passing them
+    as a plain array keeps them off the ``jax.jit`` boundary. Passing ``start``/``end``/``schedule``
+    into ``sample_actions`` directly would either force a recompile every time the measured
+    inference delay changes, or fail outright (strings are not valid JAX types).
+
+    With ``start=2, end=5, total=8, schedule="linear"`` the result is::
+
+        1  1  .75  .5  .25  0  0  0
+
+    The first ``start`` entries are 1 — those actions are *hard* inpainted, because they will
+    already have been executed from the previous chunk by the time this chunk takes over, so
+    the new chunk must agree with them exactly. Weights then decay to 0 at ``end``, and are 0
+    beyond it, leaving the tail of the chunk free.
+
+    Args:
+        start: Inference delay, in control steps. Actions before this index are frozen.
+        end: Prefix attention horizon — the index at which guidance reaches zero. Must not
+            exceed the number of valid (overlapping) actions in the previous chunk.
+        total: Action horizon of the model.
+        schedule: Decay shape between ``start`` and ``end``.
+
+    Returns:
+        ``float32[total]`` weights in ``[0, 1]``.
+    """
+    start = min(start, end)
+    idx = np.arange(total)
+    if schedule == "ones":
+        w = np.ones(total, dtype=np.float32)
+    elif schedule == "zeros":
+        w = (idx < start).astype(np.float32)
+    elif schedule in ("linear", "exp"):
+        w = np.clip((start - 1 - idx) / (end - start + 1) + 1, 0.0, 1.0)
+        if schedule == "exp":
+            w = w * np.expm1(w) / (np.e - 1)
+    else:
+        raise ValueError(f"Invalid prefix attention schedule: {schedule}")
+    return np.where(idx >= end, 0.0, w).astype(np.float32)
 
 
 @dataclasses.dataclass(frozen=True)

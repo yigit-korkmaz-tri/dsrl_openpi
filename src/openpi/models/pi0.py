@@ -63,6 +63,54 @@ def posemb_sincos(
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
+def guided_velocity(
+    velocity_fn,
+    x_t: at.Float[at.Array, "b ah ad"],
+    time: at.Float[at.Array, ""],
+    prev_action_chunk: at.Float[at.Array, "b ah ad"],
+    prefix_weights: at.Float[at.Array, " ah"],
+    max_guidance_weight: float,
+) -> at.Float[at.Array, "b ah ad"]:
+    """Real-time chunking guidance: nudge the flow toward ``prev_action_chunk`` where weighted.
+
+    This is the pi-GDM-style "pinv-corrected velocity" from the RTC paper's reference
+    implementation, TRANSLATED INTO THIS FILE'S TIME CONVENTION, which is reversed relative to
+    that implementation. Here (see ``compute_loss``) ``t=1`` is noise and ``t=0`` is data,
+    ``x_t = t * noise + (1 - t) * a``, and ``v = noise - a``, so integration runs 1 -> 0 with
+    ``dt < 0``. The reference uses ``s = 1 - t`` and a velocity pointing the other way. Two
+    consequences, both easy to get backwards:
+
+      * The predicted data endpoint is ``a_hat = x_t - t * v`` (substitute: ``x_t - t(noise - a)
+        = t*noise + (1-t)a - t*noise + t*a = a``). This happens to be the exact same *function*
+        of ``x_t`` as the reference's ``x_1 = x_t + v * (1 - s)``, so the VJP below is identical.
+      * The correction is SUBTRACTED, not added. Matching the per-step displacement between the
+        two conventions gives ``dt_ours * (v_ours + delta) = dt_ref * (v_ref + g * corr)`` with
+        ``dt_ours = -dt_ref`` and ``v_ours = -v_ref``, hence ``delta = -g * corr``. Intuitively:
+        ``corr`` is the direction in ``x_t`` that moves ``a_hat`` toward the target, and since we
+        integrate toward data with a NEGATIVE ``dt``, the velocity must carry ``-corr`` for the
+        actual displacement to be ``+corr``.
+
+    The guidance weight ``((1-t)^2 + t^2) / (t * (1-t))`` is the reference's
+    ``c * inv_r2`` with ``s = 1 - t`` substituted and simplified. It diverges at both ends of the
+    trajectory, which is what ``max_guidance_weight`` clips (and it subsumes the reference's
+    ``nan_to_num(posinf=max_guidance_weight)`` at ``t = 1``).
+    """
+
+    def denoiser(x):
+        v = velocity_fn(x, time)
+        return x - time * v, v
+
+    a_hat, vjp_fun, v_t = jax.vjp(denoiser, x_t, has_aux=True)
+    # Batch elements are independent (attention never crosses the batch), so the VJP of the
+    # batched denoiser with a batched cotangent is exactly the per-sample correction -- no vmap.
+    error = (prev_action_chunk - a_hat) * prefix_weights[:, None]
+    correction = vjp_fun(error)[0]
+
+    denom = jnp.maximum(time * (1.0 - time), 1e-6)
+    guidance_weight = jnp.minimum(((1.0 - time) ** 2 + time**2) / denom, max_guidance_weight)
+    return v_t - guidance_weight * correction
+
+
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
@@ -246,7 +294,28 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        prev_action_chunk: at.Float[at.Array, "b ah ad"] | None = None,
+        prefix_weights: at.Float[at.Array, " ah"] | None = None,
+        max_guidance_weight: float = 5.0,
     ) -> _model.Actions:
+        """Sample an action chunk, optionally with real-time chunking (RTC) guidance.
+
+        RTC (Black et al., 2025, "Real-Time Execution of Action Chunking Flow Policies") solves the
+        discontinuity you get when a new chunk is generated while the previous one is still
+        executing: naively swapping chunks makes the arm jump, because the new chunk was never told
+        what the old one committed to. RTC turns chunk generation into an *inpainting* problem —
+        the new chunk is guided toward the previous chunk's overlapping actions, hard at the front
+        (those actions will already have been executed by the time this chunk lands) and decaying
+        to free at ``prefix_weights``' horizon.
+
+        Pass ``prev_action_chunk`` and ``prefix_weights`` together, both in MODEL action space
+        (normalized and padded to ``action_dim``), with ``prev_action_chunk`` already time-shifted
+        so index 0 lines up with this chunk's index 0. Omit both for ordinary unguided sampling.
+
+        Cost: guidance needs a vector-Jacobian product through the suffix pass at every denoising
+        step, so expect roughly 2-3x the unguided inference time. The (large) prefix pass is still
+        done once and cached, and is not differentiated through.
+        """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -261,8 +330,10 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        def step(carry):
-            x_t, time = carry
+        if (prev_action_chunk is None) != (prefix_weights is None):
+            raise ValueError("prev_action_chunk and prefix_weights must be provided together.")
+
+        def velocity(x_t, time):
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
@@ -291,8 +362,14 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
+        def step(carry):
+            x_t, time = carry
+            if prev_action_chunk is None:
+                v_t = velocity(x_t, time)
+            else:
+                v_t = guided_velocity(velocity, x_t, time, prev_action_chunk, prefix_weights, max_guidance_weight)
             return x_t + dt * v_t, time + dt
 
         def cond(carry):

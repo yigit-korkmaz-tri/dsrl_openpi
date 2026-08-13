@@ -29,7 +29,7 @@ LAYOUT (verified against the code, 2026-08-06):
 
 !!! IMAGES — the two things that are easy to get wrong
   [1] LETTERBOX, DON'T SQUASH. openpi's ``preprocess_observation``
-      (dsrl_openpi/src/openpi/models/model.py:150-166) resizes to 224x224 with
+      (dsrl_openpi/src/openpi/models/model.py) resizes to 224x224 with
       ``resize_with_pad`` — aspect preserved, zero-padded — and ONLY when the input is
       not already 224x224. Training fed 1280x720 frames, so the model learned
       LETTERBOXED images with black bars. Pre-squashing 16:9 -> 1:1 with cv2.resize
@@ -41,27 +41,68 @@ LAYOUT (verified against the code, 2026-08-06):
       ``server.py:_FLIP_CAMERAS`` AND by ``converter.py:_FLIP_CAMERAS`` on the SVO2 ->
       training path, so the training images already have it and raiden's obs already
       matches. Flipping again here would invert it.
+
+REAL-TIME CHUNKING (``--bridge-kwargs '{"realtime_chunking": true}'``)
+  Without it, the arm executes a whole chunk, then stops and waits for the next one; the
+  pause is visible, and the two chunks do not join smoothly because the second was
+  generated with no knowledge of what the first committed to.
+
+  RTC (Black et al., 2025) fixes both. This bridge delegates the whole mechanism to
+  ``openpi_client.action_chunk_broker.RealTimeActionChunkBroker``, which replans in the
+  background every ``execute_horizon`` steps and conditions each new chunk on the one
+  currently executing — the server inpaints the overlap so the chunks agree where they
+  meet. Do NOT reimplement that loop here: the alignment between the two halves is the
+  part that is easy to get wrong, and it is tested in the openpi repo.
+
+  Two settings matter:
+    * ``inference_delay`` — round-trip latency measured in CONTROL STEPS (not ms), i.e.
+      ``ceil(latency_s * action_hz)``. It is the length of the hard-pinned prefix, so
+      round it UP; too low costs continuity, too high costs a little reactivity. Watch
+      the "arrived at index N but only the first M actions were pinned" warnings.
+    * ``execute_horizon`` — how often to replan. Must be >= ``inference_delay``, and
+      ``execute_horizon + inference_delay`` must fit inside the checkpoint's action
+      horizon (10 for pi05_yam_pickbanana).
 """
 
 from __future__ import annotations
 
-import concurrent.futures
-import copy
 import os
 from pathlib import Path
 import sys
-import threading
 
 import numpy as np
 from raiden.inference import ModelBridge
 
-# openpi-client MUST come from a checkout whose websocket protocol matches the SERVER's.
-# dsrl_openpi's tree is internally skewed: its client wraps the payload in an envelope
-# {"method": "infer", "obs": obs}, but its websocket_policy_server hands the unpacked
-# message STRAIGHT to policy.infer() — so the transform sees {"method", "obs"} and dies
-# with KeyError: 'observation/image_head'. The upstream ~/openpi client sends the bare
-# obs dict, which is what the server (byte-identical file in both trees) expects.
-_OPENPI_CLIENT_HOME = Path.home() / "openpi" / "packages" / "openpi-client" / "src"
+# openpi-client must come from THIS repo's dsrl_openpi checkout, not upstream ~/openpi: the
+# real-time chunking broker lives here and does not exist upstream.
+#
+# Historical trap: dsrl_openpi's client wraps every message in an envelope
+# ``{"method": ..., "obs": ...}`` while its websocket server used to hand whatever arrived
+# straight to ``policy.infer()`` — so this client could not talk to its own server, and
+# deployments worked around it by importing the client from ~/openpi instead (which silently
+# made the RTC broker unreachable). The server now accepts both wire formats, so pointing at
+# dsrl_openpi is correct again. If you see ``KeyError: 'observation/image_head'`` server-side,
+# the server predates that fix — update dsrl_openpi.
+def _resolve_openpi_client() -> Path:
+    candidates = [
+        Path(p) for p in (os.environ.get("OPENPI_CLIENT_PATH"),) if p
+    ]
+    candidates += [
+        # Alongside this file, when this module ships inside the dsrl_openpi checkout.
+        Path(__file__).resolve().parent.parent / "packages" / "openpi-client" / "src",
+        Path.home() / "dsrl_openpi" / "packages" / "openpi-client" / "src",
+        Path.home() / "robometer-policy-learning" / "third_party" / "dsrl_openpi" / "packages" / "openpi-client" / "src",
+    ]
+    for candidate in candidates:
+        if (candidate / "openpi_client").is_dir():
+            return candidate
+    raise RuntimeError(
+        "could not locate the dsrl_openpi openpi-client package; set OPENPI_CLIENT_PATH to "
+        "<dsrl_openpi>/packages/openpi-client/src"
+    )
+
+
+_OPENPI_CLIENT_HOME = _resolve_openpi_client()
 if str(_OPENPI_CLIENT_HOME) not in sys.path:
     sys.path.insert(0, str(_OPENPI_CLIENT_HOME))
 
@@ -91,18 +132,6 @@ def _as_bool(value) -> bool:
     return bool(value)
 
 
-def _snapshot_obs_dict(obs_dict: dict) -> dict:
-    """Copy the openpi observation before sending it from a worker thread."""
-
-    out = {}
-    for key, value in obs_dict.items():
-        if isinstance(value, np.ndarray):
-            out[key] = np.array(value, copy=True)
-        else:
-            out[key] = copy.deepcopy(value)
-    return out
-
-
 class OpenPIBridge(ModelBridge):
     """Drives a pi05 (openpi) policy server inside raiden's `rd infer` loop."""
 
@@ -112,14 +141,8 @@ class OpenPIBridge(ModelBridge):
         self._horizon: int | None = None  # None => execute the full served chunk
         self._chunk: np.ndarray | None = None  # cached (chunk_len, 14)
         self._step = 0
-        self._last_action: np.ndarray | None = None
         self._realtime_chunking = False
-        self._replan_margin: int | None = None
-        self._chunk_overrun_behavior = "hold"
-        self._executor: concurrent.futures.ThreadPoolExecutor | None = None
-        self._next_future: concurrent.futures.Future | None = None
-        self._ws_lock = threading.Lock()
-        self._generation = 0
+        self._broker = None
 
     # -- ModelBridge API ------------------------------------------------------
 
@@ -153,43 +176,48 @@ class OpenPIBridge(ModelBridge):
                 os.environ.get("OPENPI_REALTIME_CHUNKING", "false"),
             )
         )
-        _margin = kwargs.get("replan_margin", os.environ.get("OPENPI_REPLAN_MARGIN"))
-        self._replan_margin = int(_margin) if _margin else None
-        self._chunk_overrun_behavior = str(
-            kwargs.get(
-                "chunk_overrun_behavior",
-                os.environ.get("OPENPI_CHUNK_OVERRUN_BEHAVIOR", "hold"),
+
+        if "replan_margin" in kwargs or os.environ.get("OPENPI_REPLAN_MARGIN"):
+            # The old prefetch-only implementation counted steps remaining at the END of a chunk.
+            # RTC replans on a fixed period instead, so silently reinterpreting the number would
+            # change the replan rate without saying so.
+            raise ValueError(
+                "replan_margin was removed with the switch to real-time chunking; pass "
+                "execute_horizon instead (the replan PERIOD in control steps, roughly "
+                "action_horizon - replan_margin)."
             )
-        )
-        if self._chunk_overrun_behavior not in ("hold", "block"):
-            raise ValueError("chunk_overrun_behavior must be 'hold' or 'block'")
-        if self._realtime_chunking and self._executor is None:
-            self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
         from openpi_client import websocket_client_policy as _ws
 
         print(f"[OpenPIBridge] connecting to openpi server {host}:{port} ...")
         self._preflight(host, port)
         self._ws = _ws.WebsocketClientPolicy(host=host, port=port)
+
+        rtc_summary = ""
+        if self._realtime_chunking:
+            self._broker = self._make_broker(kwargs)
+            rtc_summary = (
+                f" | execute_horizon={self._execute_horizon} "
+                f"| inference_delay={self._inference_delay} "
+                f"| schedule={self._prefix_attention_schedule} "
+                f"| overrun={self._chunk_overrun_behavior}"
+            )
+
         print(
             f"[OpenPIBridge] connected | metadata={self._ws.get_server_metadata()} | "
             f"prompt={self._prompt!r} | action_horizon="
             f"{self._horizon if self._horizon else 'full served chunk'} | "
-            f"realtime_chunking={self._realtime_chunking}"
-            + (
-                f" | replan_margin={self._replan_margin or 'half horizon'} | overrun={self._chunk_overrun_behavior}"
-                if self._realtime_chunking
-                else ""
-            )
+            f"realtime_chunking={self._realtime_chunking}" + rtc_summary
         )
 
     def predict(self, obs) -> np.ndarray:
         """One control step: obs -> (14,) absolute joint action [l7, r7]."""
         if self._realtime_chunking:
-            return self._predict_realtime(obs)
+            action = self._broker.infer(self._build_obs(obs))["actions"]
+            return self._validate_action(action)
 
         if self._chunk is None:
-            self._install_chunk(self._query(obs))
+            self._chunk, self._step = self._query(obs), 0
         action = self._chunk[self._step].copy()
         self._step += 1
         if self._step >= (self._horizon or self._chunk.shape[0]):
@@ -200,75 +228,44 @@ class OpenPIBridge(ModelBridge):
         """Handback / episode reset: drop the cached chunk so the next predict()
         re-infers on the CURRENT (post-correction) observation instead of replaying
         stale actions aimed at the pre-intervention pose."""
-        self._generation += 1
-        if self._next_future is not None:
-            self._next_future.cancel()
         self._chunk, self._step = None, 0
-        self._last_action = None
-        self._next_future = None
+        if self._broker is not None:
+            self._broker.reset()
 
     # -- helpers --------------------------------------------------------------
 
-    def _predict_realtime(self, obs) -> np.ndarray:
-        """Single control step with background prefetch of the next action chunk."""
-        if self._chunk is None:
-            installed = self._install_pending_if_ready(block=self._chunk_overrun_behavior == "block")
-            if not installed:
-                if self._last_action is not None and self._chunk_overrun_behavior == "hold":
-                    return self._last_action.copy()
-                self._install_chunk(self._query(obs))
+    def _make_broker(self, kwargs: dict):
+        from openpi_client import action_chunk_broker
 
-        effective_horizon = self._effective_horizon()
-        remaining = effective_horizon - self._step
-        if self._next_future is None and remaining <= self._effective_replan_margin(effective_horizon):
-            self._submit_next_chunk(obs)
+        def _setting(name, env, default, cast):
+            value = kwargs.get(name, os.environ.get(env))
+            return default if value is None or value == "" else cast(value)
 
-        action = self._chunk[self._step].copy()
-        self._last_action = action
-        self._step += 1
+        self._execute_horizon = _setting("execute_horizon", "OPENPI_EXECUTE_HORIZON", None, int)
+        self._inference_delay = _setting("inference_delay", "OPENPI_INFERENCE_DELAY", 1, int)
+        self._prefix_attention_schedule = _setting(
+            "prefix_attention_schedule", "OPENPI_PREFIX_ATTENTION_SCHEDULE", "exp", str
+        )
+        self._max_guidance_weight = _setting("max_guidance_weight", "OPENPI_MAX_GUIDANCE_WEIGHT", 5.0, float)
+        self._chunk_overrun_behavior = _setting(
+            "chunk_overrun_behavior", "OPENPI_CHUNK_OVERRUN_BEHAVIOR", "hold", str
+        )
 
-        if self._step >= effective_horizon and not self._install_pending_if_ready(block=False):
-            self._chunk = None
+        return action_chunk_broker.RealTimeActionChunkBroker(
+            self._ws,
+            execute_horizon=self._execute_horizon,
+            inference_delay=self._inference_delay,
+            prefix_attention_schedule=self._prefix_attention_schedule,
+            max_guidance_weight=self._max_guidance_weight,
+            exhausted_behavior=self._chunk_overrun_behavior,
+        )
 
-        return np.asarray(action, dtype=np.float32)
-
-    def _install_chunk(self, chunk: np.ndarray) -> None:
-        self._chunk = chunk
-        self._step = 0
-
-    def _effective_horizon(self) -> int:
-        assert self._chunk is not None
-        return self._horizon or self._chunk.shape[0]
-
-    def _effective_replan_margin(self, horizon: int) -> int:
-        if self._replan_margin is None:
-            return max(1, horizon // 2)
-        if self._replan_margin < 0 or self._replan_margin > horizon:
-            raise ValueError("replan_margin must be between 0 and the effective action horizon")
-        return self._replan_margin
-
-    def _submit_next_chunk(self, obs) -> None:
-        assert self._executor is not None
-        generation = self._generation
-        obs_dict = _snapshot_obs_dict(self._build_obs(obs))
-        self._next_future = self._executor.submit(self._query_built_obs, obs_dict, generation)
-
-    def _query_built_obs(self, obs_dict: dict, generation: int) -> tuple[int, np.ndarray]:
-        return generation, self._query_obs_dict(obs_dict)
-
-    def _install_pending_if_ready(self, *, block: bool) -> bool:
-        if self._next_future is None:
-            return False
-        if not block and not self._next_future.done():
-            return False
-
-        future = self._next_future
-        self._next_future = None
-        generation, chunk = future.result()
-        if generation != self._generation:
-            return False
-        self._install_chunk(chunk)
-        return True
+    @staticmethod
+    def _validate_action(action) -> np.ndarray:
+        action = np.asarray(action, dtype=np.float32)
+        if action.shape != (_DOF * 2,):
+            raise RuntimeError(f"expected a ({_DOF * 2},) action from the openpi server, got {action.shape}")
+        return action
 
     @staticmethod
     def _parse_addr(spec: str) -> tuple[str, int]:
@@ -309,13 +306,8 @@ class OpenPIBridge(ModelBridge):
 
     def _query(self, obs) -> np.ndarray:
         """Send one observation, return the validated (chunk_len, 14) action chunk."""
-        return self._query_obs_dict(self._build_obs(obs))
-
-    def _query_obs_dict(self, obs_dict: dict) -> np.ndarray:
-        """Send one prepared observation, return the validated action chunk."""
         assert self._ws is not None, "load() must be called before predict()"
-        with self._ws_lock:
-            chunk = np.asarray(self._ws.infer(obs_dict)["actions"], dtype=np.float32)
+        chunk = np.asarray(self._ws.infer(self._build_obs(obs))["actions"], dtype=np.float32)
         if chunk.ndim != 2 or chunk.shape[1] != _DOF * 2:
             raise RuntimeError(f"expected a (chunk, {_DOF * 2}) action chunk from the openpi server, got {chunk.shape}")
         # The requested horizon must never exceed what the checkpoint emits: dispensing

@@ -45,6 +45,21 @@ class WebsocketPolicyServer:
         ) as server:
             await server.serve_forever()
 
+    def _dispatch(self, method: str, obs: dict):
+        if method == "infer":
+            # The client folds `noise` into the observation dict (there is nowhere else to put it
+            # on the wire), but Policy.infer takes it as a keyword-only argument.
+            noise = obs.pop("noise", None) if isinstance(obs, dict) else None
+            if noise is None:
+                return self._policy.infer(obs)
+            return self._policy.infer(obs, noise=noise)
+        if method == "get_prefix_rep":
+            get_prefix_rep = getattr(self._policy, "get_prefix_rep", None)
+            if get_prefix_rep is None:
+                raise ValueError(f"{type(self._policy).__name__} does not implement get_prefix_rep.")
+            return get_prefix_rep(obs)
+        raise ValueError(f"Unknown method {method!r}; expected 'infer' or 'get_prefix_rep'.")
+
     async def _handler(self, websocket: _server.ServerConnection):
         logger.info(f"Connection from {websocket.remote_address} opened")
         packer = msgpack_numpy.Packer()
@@ -57,8 +72,10 @@ class WebsocketPolicyServer:
                 start_time = time.monotonic()
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
+                method, obs = _unpack_request(obs)
+
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                action = self._dispatch(method, obs)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {
@@ -81,6 +98,23 @@ class WebsocketPolicyServer:
                     reason="Internal server error. Traceback included in previous frame.",
                 )
                 raise
+
+
+def _unpack_request(request) -> tuple[str, dict]:
+    """Accept both wire formats and return `(method, obs)`.
+
+    This repo's `openpi_client.WebsocketClientPolicy` wraps every message in an envelope,
+    `{"method": ..., "obs": ...}`, while upstream openpi's client sends the bare observation dict.
+    The server used to hand whatever arrived straight to `policy.infer`, so this repo's own client
+    could not talk to this repo's own server: the transform saw `{"method", "obs"}` and died with
+    `KeyError: 'observation/image_head'`. Deployments worked around it by importing the client from
+    an upstream checkout instead -- which in turn made anything added to this client (such as the
+    real-time chunking broker) unreachable on the robot. Supporting both formats here fixes the
+    skew without breaking either client.
+    """
+    if isinstance(request, dict) and "obs" in request and set(request) <= {"method", "obs"}:
+        return str(request.get("method", "infer")), request["obs"]
+    return "infer", request
 
 
 def _health_check(connection: _server.ServerConnection, request: _server.Request) -> _server.Response | None:

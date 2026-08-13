@@ -961,9 +961,7 @@ _CONFIGS = [
         ema_decay=None,  # EMA off for LoRA finetuning
         batch_size=16,
         num_train_steps=5_000,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=200, peak_lr=5e-5, decay_steps=5_000, decay_lr=5e-5
-        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=200, peak_lr=5e-5, decay_steps=5_000, decay_lr=5e-5),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
     ),
     # Flow-MILE, LoRA. Trains pi0.5 on an exported HITL LeRobot dataset with the MILE objective:
@@ -1000,9 +998,7 @@ _CONFIGS = [
         ema_decay=None,
         batch_size=8,
         num_train_steps=5_000,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=200, peak_lr=5e-5, decay_steps=5_000, decay_lr=5e-5
-        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=200, peak_lr=5e-5, decay_steps=5_000, decay_lr=5e-5),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         flow_mile=FlowMileParams(
             lambda_intervention=1.0,
@@ -1350,18 +1346,12 @@ _CONFIGS = [
                     inputs=[
                         _transforms.RepackTransform(
                             {
-                                "observation/image_head":
-                                    "observation.images.scene_camera",
-                                "observation/image_left_wrist":
-                                    "observation.images.left_wrist_camera",
-                                "observation/image_right_wrist":
-                                    "observation.images.right_wrist_camera",
-                                "observation/state":
-                                    "observation.state",
-                                "actions":
-                                    "action",
-                                "prompt":
-                                    "prompt",
+                                "observation/image_head": "observation.images.scene_camera",
+                                "observation/image_left_wrist": "observation.images.left_wrist_camera",
+                                "observation/image_right_wrist": "observation.images.right_wrist_camera",
+                                "observation/state": "observation.state",
+                                "actions": "action",
+                                "prompt": "prompt",
                             }
                         )
                     ]
@@ -1372,9 +1362,7 @@ _CONFIGS = [
             ),
         ),
         # Initialize from the normal full π0.5 base checkpoint.
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_base/params"
-        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         # LoRA: freeze the non-LoRA parameters.
         # IMPORTANT: this Pi0Config must match `model=` above.
         freeze_filter=pi0_config.Pi0Config(
