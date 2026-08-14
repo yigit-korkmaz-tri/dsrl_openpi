@@ -1005,14 +1005,14 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         flow_mile=FlowMileParams(
-            lambda_intervention=1.0,
+            lambda_intervention=0.1,
             probit_scale=1.0,
             intervention_cost=0.0,
             anchor_loss_weight=0.01,
-            num_samples=4,
+            num_samples=1,
             score_mc_samples=1,
             expected_rollout_score_weight=1.0,
-            num_sample_steps=10,
+            num_sample_steps=5,
             reference_relative_score=True,
             # Read the frozen-rollout baseline from a collection-time pool (needs a HITL repo exported
             # from HDF5 collected with hitl.rollout_pool_size>=num_samples).
