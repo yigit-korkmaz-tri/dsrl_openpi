@@ -444,16 +444,26 @@ class LeRobotLiberoHitlDataConfig(DataConfigFactory):
             )
         model_transforms = ModelTransformFactory()(model_config)
         base = self.create_base_config(assets_dirs, model_config)
-        # Flow-MILE: normalize the rollout-sample pool with the SAME action stats (the existing
-        # Normalize transform normalizes any key present in norm_stats, broadcasting over the pool/
-        # horizon dims). Guard on "actions" so this is a no-op at compute_norm_stats time (norm_stats
-        # is None there). The aliased NormStats carries q01/q99 so quantile normalization applies.
-        norm_stats = base.norm_stats
-        if norm_stats is not None and "actions" in norm_stats:
-            norm_stats = {**norm_stats, "rollout_samples": norm_stats["actions"]}
+        # Flow-MILE: normalize the rollout-sample pool with the action stats via a DEDICATED,
+        # input-ONLY Normalize appended to data_transforms.inputs -- do NOT alias it into `norm_stats`.
+        # `norm_stats` is baked into the checkpoint and drives the STRICT output Unnormalize at
+        # inference, where `rollout_samples` is absent -> "Selector key rollout_samples not found in
+        # tree". As an input-only transform it normalizes the pool during training (running before the
+        # data-loader's main Normalize) and is a no-op at inference (key absent, Normalize is
+        # non-strict). Guard on "actions" so it's skipped at compute_norm_stats time (norm_stats None).
+        if base.norm_stats is not None and "actions" in base.norm_stats:
+            data_transforms = _transforms.Group(
+                inputs=[
+                    *data_transforms.inputs,
+                    _transforms.Normalize(
+                        {"rollout_samples": base.norm_stats["actions"]},
+                        use_quantiles=base.use_quantile_norm,
+                    ),
+                ],
+                outputs=data_transforms.outputs,
+            )
         return dataclasses.replace(
             base,
-            norm_stats=norm_stats,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -1281,7 +1291,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_yam_mugontree",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=15),
         data=SimpleDataConfig(
             repo_id="robot-lab/hang_mug_on_mug_tree",
             assets=AssetsConfig(asset_id="pi05_yam_mugontree"),
@@ -1326,7 +1336,7 @@ _CONFIGS = [
         name="pi05_yam_mugontree_lora",
         model=pi0_config.Pi0Config(
             pi05=True,
-            action_horizon=25,
+            action_horizon=15,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
@@ -1379,7 +1389,7 @@ _CONFIGS = [
         # IMPORTANT: this Pi0Config must match `model=` above.
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
-            action_horizon=10,
+            action_horizon=15,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
