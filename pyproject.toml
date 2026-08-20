@@ -64,6 +64,13 @@ rlds = [
     "tensorflow-cpu==2.15.0",
     "tensorflow-datasets==4.9.9",
 ]
+sagemaker = [
+    # Only needed on the launching machine (sagemaker/launch_training.py); the training image does
+    # not install this group.
+    # v3.0 removed sagemaker.aws_batch, which is how jobs reach the training queues.
+    "sagemaker>=2.251.0,<3.0.0",
+    "boto3>=1.35.0",
+]
 
 [tool.uv]
 override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
@@ -79,7 +86,13 @@ members = ["packages/*"]
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-extend-exclude = ["docker", "third_party", "src/openpi/models_pytorch/transformers_replace/*"]
+extend-exclude = [
+    "docker",
+    "third_party",
+    "src/openpi/models_pytorch/transformers_replace/*",
+    # Reference launcher copied verbatim from another team; kept unmodified for comparison.
+    "sagemaker/launch_pi05_template.py",
+]
 
 [tool.ruff.lint]
 # https://docs.astral.sh/ruff/rules/

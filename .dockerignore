@@ -1,3 +1,11 @@
 .venv
 checkpoints
 data
+.git
+wandb
+logs
+secrets.env
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache

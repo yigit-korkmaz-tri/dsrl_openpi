@@ -32,10 +32,24 @@ about its videos. The episode_index -> source mapping is written to meta/source_
 
 A directory that has no numeric episode subdirectories is treated as a PARENT of raw datasets and
 descended one level, so --args.raw-dirs /data/processed picks up /data/processed/*/NNNN.
+
+DOWNSCALING (--args.resize-width): the videos are random-seek decoded once per training sample, so
+their resolution sets the data-loading cost of every run that uses the dataset. openpi feeds images
+through ``resize_with_pad(224, 224)``, which for 16:9 source scales 1280x720 down to 224x126 and
+pads the rest -- so anything stored above 224 pixels wide is decoded and then thrown away. Measured
+on a 1280x720 three-camera dataset, one worker managed 1.5 samples/s (656 ms/sample), which starved
+8 H100s at openpi's default of 2 dataloader workers.
+
+  --args.resize-width 320    # 16x fewer pixels, keeps a margin above the 224 the model uses
+  --args.resize-width 224    # minimum for pi0.5: openpi then pads without resampling at all
+
+Aspect ratio is always preserved (ffmpeg picks the height), so the padding openpi applies is
+unchanged and the images the model sees are the same modulo one extra resample.
 """
 
 import dataclasses
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -90,6 +104,10 @@ class Args:
     """Whether to create a private repo on HuggingFace Hub."""
     overwrite: bool = False
     """Whether to overwrite the existing dataset."""
+    resize_width: int | None = None
+    """Downscale the encoded videos to this width, preserving aspect ratio (None keeps the source
+    resolution). See the module docstring: openpi only ever uses 224 pixels of width, and video
+    decode dominates training throughput. 320 is a good default; 224 is the minimum for pi0.5."""
 
     def resolved_raw_dirs(self) -> list[Path]:
         dirs = list(self.raw_dirs)
@@ -232,8 +250,34 @@ def hardlink_frames(src_dir: Path, dst_dir: Path, num_frames: int) -> None:
             shutil.copyfile(src, dst)
 
 
-def encode_video_ffmpeg(imgs_dir: Path, video_path: Path, num_frames: int, fps: int) -> None:
-    """Encode JPEG frames to H.264 MP4 with ffmpeg directly."""
+def scaled_resolution(height: int, width: int, resize_width: int | None) -> tuple[int, int]:
+    """Output ``(height, width)`` produced by ``scale={resize_width}:-2``.
+
+    Mirrors ffmpeg's ``-2``: derive the height from the source aspect ratio and round it to the
+    nearest even number (yuv420p needs both dimensions even). Computed here as well as by ffmpeg
+    because the LeRobot feature schema declares the shape, and a schema that disagreed with the
+    encoded videos would misdescribe the dataset.
+
+    Ties round UP, matching ffmpeg -- not Python's ``round``, which rounds halves to even. They
+    disagree for e.g. 1280x720 at width 144, where the exact height is 81: ffmpeg emits 82 while
+    ``round(40.5) * 2`` gives 80.
+    """
+    if resize_width is None:
+        return height, width
+    if resize_width <= 0 or resize_width % 2:
+        raise SystemExit(f"--args.resize-width must be a positive even number, got {resize_width}")
+    if resize_width > width:
+        raise SystemExit(
+            f"--args.resize-width {resize_width} is larger than the source width {width}; "
+            "upscaling only makes the dataset slower to decode."
+        )
+    return math.floor(height * resize_width / width / 2 + 0.5) * 2, resize_width
+
+
+def encode_video_ffmpeg(
+    imgs_dir: Path, video_path: Path, num_frames: int, fps: int, resize_width: int | None = None
+) -> None:
+    """Encode PNG frames to H.264 MP4 with ffmpeg directly, optionally downscaling."""
     video_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg", "-y",
@@ -243,9 +287,13 @@ def encode_video_ffmpeg(imgs_dir: Path, video_path: Path, num_frames: int, fps: 
         "-pix_fmt", "yuv420p",
         "-crf", "22",
         "-frames:v", str(num_frames),
-        "-loglevel", "error",
-        str(video_path),
     ]
+    if resize_width is not None:
+        # -2 derives the height from the aspect ratio, rounded to an even number. Scaling here (in
+        # the encode that already happens) costs nothing extra -- the frames are being decoded and
+        # re-encoded regardless.
+        cmd += ["-vf", f"scale={resize_width}:-2"]
+    cmd += ["-loglevel", "error", str(video_path)]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg failed encoding {video_path}:\n{result.stderr}")
@@ -256,6 +304,7 @@ def process_episode(
     ep_dir: Path,
     output_dir: Path,
     fps: int = FPS,
+    resize_width: int | None = None,
 ) -> str:
     """Process one episode: bulk load lowdim, hardlink images, ffmpeg encode, save.
 
@@ -291,7 +340,7 @@ def process_episode(
         img_key = f"observation.images.{cam}"
         imgs_dir = tmp_frames_root / img_key / f"episode_{episode_index:06d}"
         video_path = output_dir / dataset.meta.get_video_file_path(episode_index, img_key)
-        encode_video_ffmpeg(imgs_dir, video_path, num_frames, fps)
+        encode_video_ffmpeg(imgs_dir, video_path, num_frames, fps, resize_width)
 
     with ThreadPoolExecutor(max_workers=3) as pool:
         list(pool.map(_encode_cam, CAMERAS))
@@ -330,11 +379,22 @@ def main(args: Args):
 
     print(f"Scanning {len(raw_dirs)} raw dataset(s):")
     ep_dirs_with_source, resolution, fps, cameras = scan_sources(raw_dirs)
-    height, width = resolution
+    src_height, src_width = resolution
+    # The declared feature shape must describe the ENCODED videos, not the raw frames.
+    height, width = scaled_resolution(src_height, src_width, args.resize_width)
     print(
-        f"Found {len(ep_dirs_with_source)} episodes total | resolution {height}x{width} | "
+        f"Found {len(ep_dirs_with_source)} episodes total | source {src_height}x{src_width} | "
         f"{fps} fps | cameras {cameras}"
     )
+    if args.resize_width is None:
+        print(
+            f"  videos stored at the source {src_height}x{src_width}. openpi only uses 224 pixels of "
+            "width, so training will decode and discard most of them -- consider "
+            "--args.resize-width 320."
+        )
+    else:
+        factor = (src_height * src_width) / (height * width)
+        print(f"  downscaling videos to {height}x{width} ({factor:.1f}x fewer pixels to decode per frame)")
 
     output_dir = HF_LEROBOT_HOME / repo_id
     if output_dir.exists():
@@ -360,8 +420,9 @@ def main(args: Args):
     for cam in CAMERAS:
         features[f"observation.images.{cam}"] = {
             "dtype": "video",
-            # Taken from the sources' own metadata (validated identical across them) rather than
-            # hardcoded, so the declared shape always matches the encoded videos.
+            # Derived from the sources' own metadata (validated identical across them) and then put
+            # through the same scaling ffmpeg will apply, so the declared shape always matches the
+            # encoded videos rather than the raw frames.
             "shape": (3, height, width),
             "names": ["channels", "height", "width"],
         }
@@ -387,7 +448,7 @@ def main(args: Args):
         label = f"{source_dir.name}/{ep_dir.name}"
         try:
             episode_index = dataset.meta.total_episodes
-            task = process_episode(dataset, ep_dir, output_dir, fps=fps)
+            task = process_episode(dataset, ep_dir, output_dir, fps=fps, resize_width=args.resize_width)
             provenance.append(
                 {
                     "episode_index": episode_index,

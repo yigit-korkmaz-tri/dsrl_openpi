@@ -1281,9 +1281,9 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_yam_mugontree",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=15),
         data=SimpleDataConfig(
-            repo_id="robot-lab/hang_mug_on_mug_tree",
+            repo_id="ykorkmaz/yam_hang_mug_on_mug_tree",
             assets=AssetsConfig(asset_id="pi05_yam_mugontree"),
             data_transforms=lambda model: _transforms.Group(
                 inputs=[yam_policy.YAMInputs(model_type=model.model_type)],
@@ -1326,7 +1326,7 @@ _CONFIGS = [
         name="pi05_yam_mugontree_lora",
         model=pi0_config.Pi0Config(
             pi05=True,
-            action_horizon=25,
+            action_horizon=15,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
@@ -1379,7 +1379,7 @@ _CONFIGS = [
         # IMPORTANT: this Pi0Config must match `model=` above.
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,
-            action_horizon=10,
+            action_horizon=15,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),

@@ -4,6 +4,11 @@ checkpoints/
 data/
 wandb/
 
+# SageMaker launch artifacts: per-job specs and working-tree diffs baked into the image.
+secrets.env
+sagemaker/configs/
+sagemaker/git_diffs/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

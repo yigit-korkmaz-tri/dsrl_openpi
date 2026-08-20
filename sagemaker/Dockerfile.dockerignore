@@ -1,0 +1,25 @@
+# BuildKit reads <dockerfile>.dockerignore in preference to the root .dockerignore, so this keeps
+# the SageMaker build context tight without changing what the other root-context builds in this
+# repo (scripts/docker, examples/*) see.
+#
+# Exclude everything, then re-include only the paths sagemaker/Dockerfile actually copies.
+*
+
+!pyproject.toml
+!uv.lock
+!.python-version
+!README.md
+!LICENSE
+!packages/
+!src/
+!scripts/
+!assets/
+!sagemaker/
+
+# Re-exclude junk living inside the re-included directories.
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.venv/
+**/.pytest_cache/
+**/.ruff_cache/
