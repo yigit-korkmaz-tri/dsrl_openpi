@@ -975,6 +975,7 @@ _CONFIGS = [
             warmup_steps=200, peak_lr=5e-5, decay_steps=5_000, decay_lr=5e-5
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_workers=8,
     ),
     # Flow-MILE, LoRA. Trains pi0.5 on an exported HITL LeRobot dataset with the MILE objective:
     #   total = BC(labels {1,2})  +  lambda * BCE_probit(labels {0,1})
@@ -1028,6 +1029,7 @@ _CONFIGS = [
             # from HDF5 collected with hitl.rollout_pool_size>=num_samples).
             use_stored_rollout_samples=True,
         ),
+        num_workers=8,
     ),
     #
     # Fine-tuning Aloha configs.
@@ -1406,6 +1408,7 @@ _CONFIGS = [
         # EMA should be disabled for LoRA fine-tuning.
         ema_decay=None,
         num_train_steps=30_000,
+        num_workers=8,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
