@@ -222,6 +222,10 @@ def main() -> None:
         # Writes to assets_base_dir/<config>/<asset_id>, i.e. the assets/ tree baked into the image.
         # Only useful when the norm stats for this config were not committed to the repo.
         norm_argv = [sys.executable, "scripts/compute_norm_stats.py", f"--config-name={config_name}"]
+        # Same dataset training reads (the launcher resolves a passed-through --data.repo-id into
+        # repo_id); without this the stats would describe the config's default repo instead.
+        if spec.get("repo_id"):
+            norm_argv.append(f"--repo-id={spec['repo_id']}")
         if spec.get("norm_stats_max_frames") is not None:
             norm_argv.append(f"--max-frames={spec['norm_stats_max_frames']}")
         _run(norm_argv)

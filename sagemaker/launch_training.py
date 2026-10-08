@@ -357,6 +357,18 @@ def validate(args: Args, train_config: _config.TrainConfig, overrides: list[str]
         raise ValueError(f"Batch size {batch_size} must be divisible by {GPUS_PER_INSTANCE} GPUs.")
 
 
+def override_value(overrides: list[str], *flags: str) -> str | None:
+    """Value of the last of ``flags`` among the train.py overrides, as ``--flag=v`` or ``--flag v``."""
+    value = None
+    for i, arg in enumerate(overrides):
+        for flag in flags:
+            if arg == flag and i + 1 < len(overrides):
+                value = overrides[i + 1]
+            elif arg.startswith(f"{flag}="):
+                value = arg.split("=", 1)[1]
+    return value
+
+
 def main(args: Args, passthrough: list[str]) -> None:
     train_config = _config.get_config(args.config)  # Raises with suggestions on a typo.
     overrides = [*shlex.split(args.train_args), *passthrough]
@@ -392,7 +404,10 @@ def main(args: Args, passthrough: list[str]) -> None:
         "config": args.config,
         "exp_name": args.exp_name,
         "data_source": args.data_source,
-        "repo_id": train_config.data.repo_id,
+        # The dataset training will actually read: a `--data.repo-id` passed through to train.py (e.g.
+        # an iterative-HITL round's exported repo) wins over the config's default. train_entry.py uses it
+        # for the S3 channel check and to point compute_norm_stats at the same dataset.
+        "repo_id": override_value(overrides, "--data.repo-id", "--data.repo_id") or train_config.data.repo_id,
         "compute_norm_stats": args.compute_norm_stats,
         "norm_stats_max_frames": args.norm_stats_max_frames,
         "overrides": overrides,

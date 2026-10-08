@@ -228,6 +228,8 @@ Useful launcher flags:
 - `--compute-norm-stats` — runs `scripts/compute_norm_stats.py` in the container before training.
   Needed when `assets/<config>/<asset_id>/norm_stats.json` does not exist locally, since `assets/`
   is gitignored and gets baked into the image from your working tree.
+  The stats are computed for the dataset training reads: a passed-through `--data.repo-id` (e.g. an
+  iterative-HITL round's exported repo) takes precedence over the config's default `repo_id`.
 - `--base-checkpoint s3://...` — overrides the weight loader's path. See "GCS egress" below.
 - `--skip-build` — reuse the image already tagged `latest` in your ECR repo. Only safe when
   nothing under `src/`, `scripts/` or `assets/` changed.
