@@ -444,16 +444,26 @@ class LeRobotLiberoHitlDataConfig(DataConfigFactory):
             )
         model_transforms = ModelTransformFactory()(model_config)
         base = self.create_base_config(assets_dirs, model_config)
-        # Flow-MILE: normalize the rollout-sample pool with the SAME action stats (the existing
-        # Normalize transform normalizes any key present in norm_stats, broadcasting over the pool/
-        # horizon dims). Guard on "actions" so this is a no-op at compute_norm_stats time (norm_stats
-        # is None there). The aliased NormStats carries q01/q99 so quantile normalization applies.
-        norm_stats = base.norm_stats
-        if norm_stats is not None and "actions" in norm_stats:
-            norm_stats = {**norm_stats, "rollout_samples": norm_stats["actions"]}
+        # Flow-MILE: normalize the rollout-sample pool with the action stats via a DEDICATED,
+        # input-ONLY Normalize appended to data_transforms.inputs -- do NOT alias it into `norm_stats`.
+        # `norm_stats` is baked into the checkpoint and drives the STRICT output Unnormalize at
+        # inference, where `rollout_samples` is absent -> "Selector key rollout_samples not found in
+        # tree". As an input-only transform it normalizes the pool during training (running before the
+        # data-loader's main Normalize) and is a no-op at inference (key absent, Normalize is
+        # non-strict). Guard on "actions" so it's skipped at compute_norm_stats time (norm_stats None).
+        if base.norm_stats is not None and "actions" in base.norm_stats:
+            data_transforms = _transforms.Group(
+                inputs=[
+                    *data_transforms.inputs,
+                    _transforms.Normalize(
+                        {"rollout_samples": base.norm_stats["actions"]},
+                        use_quantiles=base.use_quantile_norm,
+                    ),
+                ],
+                outputs=data_transforms.outputs,
+            )
         return dataclasses.replace(
             base,
-            norm_stats=norm_stats,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -674,7 +684,7 @@ class TrainConfig:
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
-    keep_period: int | None = 5000
+    keep_period: int | None = 2000
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -965,6 +975,7 @@ _CONFIGS = [
             warmup_steps=200, peak_lr=5e-5, decay_steps=5_000, decay_lr=5e-5
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_workers=8,
     ),
     # Flow-MILE, LoRA. Trains pi0.5 on an exported HITL LeRobot dataset with the MILE objective:
     #   total = BC(labels {1,2})  +  lambda * BCE_probit(labels {0,1})
@@ -1005,19 +1016,20 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         flow_mile=FlowMileParams(
-            lambda_intervention=1.0,
+            lambda_intervention=0.1,
             probit_scale=1.0,
             intervention_cost=0.0,
             anchor_loss_weight=0.01,
-            num_samples=4,
+            num_samples=1,
             score_mc_samples=1,
             expected_rollout_score_weight=1.0,
-            num_sample_steps=10,
+            num_sample_steps=5,
             reference_relative_score=True,
             # Read the frozen-rollout baseline from a collection-time pool (needs a HITL repo exported
             # from HDF5 collected with hitl.rollout_pool_size>=num_samples).
             use_stored_rollout_samples=True,
         ),
+        num_workers=8,
     ),
     #
     # Fine-tuning Aloha configs.
@@ -1396,6 +1408,7 @@ _CONFIGS = [
         # EMA should be disabled for LoRA fine-tuning.
         ema_decay=None,
         num_train_steps=30_000,
+        num_workers=8,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
