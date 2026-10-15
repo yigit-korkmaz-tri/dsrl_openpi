@@ -312,11 +312,22 @@ def _flow_mile_grads(config, online_model, state, rng, observation, actions, int
             anchor = jnp.mean(jnp.square(th_anchor_v - ref_anchor_v))
 
         total = bc + lam * bce + fm.anchor_loss_weight * anchor
+
+        # Per-label prob means: the batch-wide mean mixes label-0 (should be low), label-1 (should be
+        # high) and label-2 (zero-filled rollout pool -> meaningless), so it can't show calibration.
+        def _masked_mean(x, mask):
+            mask = mask.astype(jnp.float32)
+            return jnp.sum(x * mask) / jnp.clip(jnp.sum(mask), 1.0, None)
+
         aux = {
             "bc_loss": bc,
             "bce_loss": bce,
             "anchor_loss": anchor,
             "intervention_prob_mean": jnp.mean(probs),
+            "intervention_prob_label0": _masked_mean(probs, nonint),
+            "intervention_prob_label1": _masked_mean(probs, label1),
+            "logged_score_label0": _masked_mean(logged_scores, nonint),
+            "logged_score_label1": _masked_mean(logged_scores, label1),
             "intervention_frac": jnp.mean(label1.astype(jnp.float32)),
             "expected_rollout_score_mean": jnp.mean(expected_rollout_score),
             "logged_score_mean": jnp.mean(logged_scores),
